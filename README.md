@@ -75,7 +75,7 @@ Core
 
 /mre lock — lock the frame (no dragging)
 
-/mre unlock — unlock the frame
+/mre unlock — unlock the frame (hold down a modifier key and drag with left mouse)
 
 /mre reset — reset position & settings to defaults
 
@@ -129,7 +129,7 @@ A: Increase UI scale slightly or reduce font size in the Lua (GameFontNormalSmal
 
 # Troubleshooting
 
-If the frame doesn’t move, /mre unlock, then drag; /mre lock to fix it in place.
+If the frame doesn’t move, /mre unlock, then drag with a modifier key held down; /mre lock to fix it in place.
 
 If you see unexpected 0/0 weekly bars, you likely already meet or exceed what’s needed this week (or starting RP is already above the next threshold). The denominator is clamped at >= 0.
 

@@ -5,8 +5,41 @@ local function isNAN(value) --standard func.
   return value ~= value
 end
 local initDone = false;
+local chatReport = false
 --CREATE FRAME 
 local Frame = CreateFrame("Frame", "mreFrame", UIParent)
+
+	Frame:SetMovable(true)
+	Frame:EnableMouse(true)
+	Frame:RegisterForDrag("LeftButton")
+	Frame:SetClampedToScreen(true)   -- prevents losing it off-screen
+	Frame:SetUserPlaced(true)        -- preserve user placement
+
+	local function MRE_CanDrag()
+	return not (MorunoRank_SV and MorunoRank_SV["locked"])
+	end
+
+	Frame:SetScript("OnDragStart", function()
+		if MRE_CanDrag() and (IsShiftKeyDown() or IsControlKeyDown() or IsAltKeyDown()) then
+			this:StartMoving()
+		end
+	end)
+
+	Frame:SetScript("OnDragStop", function()
+		this:StopMovingOrSizing()
+		if MorunoRank_SV then
+			local point, _, relativePoint, x, y = this:GetPoint()
+			MorunoRank_SV["point"] = point
+			MorunoRank_SV["relativePoint"] = relativePoint
+			MorunoRank_SV["x"] = x
+			MorunoRank_SV["y"] = y
+		end
+	end)
+
+	Frame:SetScript("OnHide", function()
+		this:StopMovingOrSizing()
+	end)
+
 --AND SET EVENTS
 	Frame:RegisterEvent("CHAT_MSG_COMBAT_HONOR_GAIN")--on honorgain
 	Frame:RegisterEvent("PLAYER_PVP_KILLS_CHANGED")--"backup" event, fires when HK's update.
@@ -17,45 +50,32 @@ local Frame = CreateFrame("Frame", "mreFrame", UIParent)
 
 --UI STUFF BELOW(XML gth)
 	local backdrop = {
-		bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",  
-		edgeFile="";
-		tile = true,
-		tileSize = 32,
-		edgeSize = 32,
-		insets = {
-			left = 0,
-			right = 0,
-			top = 0,
-			bottom = 0
-		}
+		bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+		edgeFile = nil,
+		tile = true, tileSize = 32,
+		edgeSize = 0,
+		insets = { left = 0, right = 0, top = 0, bottom = 0 },
 	}
+
 	Frame:SetWidth(110)
 	Frame:SetHeight(72)
 	Frame:SetPoint('CENTER', UIParent, 'CENTER', 0,0)
 	Frame:SetFrameStrata('MEDIUM')
 	Frame:SetBackdrop(backdrop)
-	Frame:SetBackdropBorderColor(1,1,1,1)
-	Frame:SetBackdropColor(1,1,1,0.4);
-	Frame:SetScript("OnMouseDown",function()
-	  Frame:StartMoving()
-	end)
-	Frame:SetScript("OnMouseUp",function()
-		Frame:StopMovingOrSizing()
-		if IsAddOnLoaded("MorunoRankEnhanced") then
-			MorunoRank_SV["point"], _, MorunoRank_SV["relativePoint"], MorunoRank_SV["x"], MorunoRank_SV["y"] = Frame:GetPoint(); --SAVE POS IN SVs
-		end
-	end)
-	local thisWeekLabel = Frame:CreateFontString("fntString2","ARTWORK",Frame)
+	Frame:SetBackdropBorderColor(0, 0, 0, 0) -- optional noop with no edge
+	Frame:SetBackdropColor(1, 1, 1, 0.4)
+
+	local thisWeekLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
 		thisWeekLabel:SetFontObject("GameFontNormalSmall")
 		thisWeekLabel:SetPoint("TOP", Frame, "TOP", 0, -10)
 		thisWeekLabel:SetTextColor(1,1,1);
 
-	local rankLabel = Frame:CreateFontString("fntString","ARTWORK",statusBar1)
+	local rankLabel     = Frame:CreateFontString(nil, "ARTWORK", nil)
 		rankLabel:SetFontObject("GameFontNormalSmall")
 		rankLabel:SetPoint("TOP", thisWeekLabel, "BOTTOM",0,-2)
 		rankLabel:SetTextColor(1,1,1);
 
-	local totalRPCalcLabel = Frame:CreateFontString("fntString2","ARTWORK",Frame)
+	local totalRPCalcLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
 		totalRPCalcLabel:SetFontObject("GameFontNormalSmall")
 		totalRPCalcLabel:SetPoint("TOP", rankLabel, "BOTTOM", 0, -5)
 		totalRPCalcLabel:SetTextColor(1,1,1);
@@ -72,37 +92,35 @@ local Frame = CreateFrame("Frame", "mreFrame", UIParent)
 		statusBar2:SetBackdropColor(0,0,0,0.5);
 		statusBar2:SetStatusBarColor(0,0,1)
 
-	local statusBar2_Text = statusBar2:CreateFontString("fntString","ARTWORK",statusBar2)
+	local statusBar2_Text = statusBar2:CreateFontString(nil, "ARTWORK", nil)
 		statusBar2_Text:SetFontObject("GameFontNormalSmall")
 		statusBar2_Text:SetPoint("CENTER", statusBar2, "CENTER",0,0)
 		statusBar2_Text:SetTextColor(1,1,1);
 
-	local text2 = Frame:CreateFontString("fntString3","ARTWORK",Frame)
+	local text2           = Frame:CreateFontString(nil, "ARTWORK", nil)
 		text2:SetFontObject("GameFontNormalSmall")
 		text2:SetPoint("CENTER", Frame, "TOP", 0, 0)
 		text2:SetTextColor(1,0.4,0.7); --PALADIN COLOUR OFC
 		text2:SetText("MorunoRankEnhanced");
 
-	local text3 = Frame:CreateFontString("fntString3","ARTWORK",Frame)
+	local text3           = Frame:CreateFontString(nil, "ARTWORK", nil)
 		text3:SetFontObject("GameFontDarkGraySmall")
 		text3:SetPoint("BOTTOM", Frame, "BOTTOM", 0, 1)
 		text3:SetAlpha(0.3)
 		text3:SetText("STRETPAKET");
 
 		-- Turtle helpers (labels)
-	local cityLabel = Frame:CreateFontString(nil, "ARTWORK", Frame)
+	local cityLabel       = Frame:CreateFontString(nil, "ARTWORK", nil)
 		cityLabel:SetFontObject("GameFontNormalSmall")
 		cityLabel:SetPoint("TOP", text3, "TOP", 0, 12)
 		cityLabel:SetTextColor(0.9, 0.9, 0.3)
 
-	local raceLabel = Frame:CreateFontString(nil, "ARTWORK", Frame)
+	local raceLabel       = Frame:CreateFontString(nil, "ARTWORK", nil)
 		raceLabel:SetFontObject("GameFontNormalSmall")
 		raceLabel:SetPoint("TOP", cityLabel, "BOTTOM", 0, -12)
 		raceLabel:SetTextColor(0.9, 0.9, 0.3)
 
 --UI STUFF DONE
-
-
 
 
 --CORE LOGIC BELOW WRITTEN BY MARTOCK(thread: https://forum.nostalrius.org/viewtopic.php?f=63&t=22558)
@@ -165,6 +183,8 @@ local function MorunoRank()
 
     local CurrentRank = getCurrentRank(CurrentRP);
     local RA = CurrentRP;
+	local CPup, CPlo, RPup, RPlo = 0, 0, 0, 0
+
 
     -- Original CP -> RP bracket mapping (unchanged)
     if (CPLast < 910) then CPup=0;CPlo=0;RPup=0;RPlo=0; end;
@@ -216,13 +236,13 @@ local function MorunoRank()
         totalRPCalcLabel:SetText("(^_^)");
         statusBar2:SetValue(0);
         if chatReport then
-            DEFAULT_CHAT_FRAME:AddMessage("Current RP: "..CurrentRP.." at "..PercentPVPRank.."% (Rank "..CurrentRank..") RP To Next Rank: "..NeededRPToNextRank.." This Week RP gained:"..math.floor(RB).." @ Total RP Calc: "..EEarns.." at "..PercentNextPVPRank.."%(Rank "..EarnedRank..")","emote");
+            DEFAULT_CHAT_FRAME:AddMessage("Current RP: "..CurrentRP.." at "..PercentPVPRank.."% (Rank "..CurrentRank..") RP To Next Rank: "..NeededRPToNextRank.." This Week RP gained:"..math.floor(RB).." @ Total RP Calc: "..EEarns.." at "..PercentNextPVPRank.."%(Rank "..EarnedRank..")", 1, 1, 0);
             chatReport = false;
         end
     else
         if chatReport then
             local floorNote = floorApplied and " [Turtle Floor Applied]" or ""
-            DEFAULT_CHAT_FRAME:AddMessage("Current RP: "..CurrentRP.." at "..PercentPVPRank.."% (Rank "..CurrentRank..") RP To Next Rank: "..NeededRPToNextRank.." This Week RP gained:"..math.floor(RB).." @ Total RP Calc: "..EEarns.." at "..PercentNextPVPRank.."%(Rank "..EarnedRank..")"..floorNote,"emote");
+            DEFAULT_CHAT_FRAME:AddMessage("Current RP: "..CurrentRP.." at "..PercentPVPRank.."% (Rank "..CurrentRank..") RP To Next Rank: "..NeededRPToNextRank.." This Week RP gained:"..math.floor(RB).." @ Total RP Calc: "..EEarns.." at "..PercentNextPVPRank.."%(Rank "..EarnedRank..")"..floorNote, 1, 1, 0);
             chatReport = false;
         end
         local floorTag = floorApplied and " (floor)" or ""
@@ -339,7 +359,7 @@ end
 --INIT DONE.
 
 --SLASH MSGs
-function SlashCmd(msg, self) 	
+function SlashCmd(msg)
 	if msg == "hide" or msg == "h" then
 		Frame:Hide();
 		MorunoRank_SV["hidden"] = true;
@@ -381,13 +401,21 @@ function SlashCmd(msg, self)
 			turtleMode   = true,
 			cityCutoffHK = 0,
 			raceCutoffHK = 0,
-			race         = ""
+			race         = "",
+			showBanners  = false,
 		}
 		Frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
 		Frame:Show()
 		Frame:EnableMouse(true)
 		Frame:SetMovable(true)
-		DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced was reset to original settings(placed in the middle of the screen)")
+
+		cityLabel:SetText(""); cityLabel:Hide()
+		raceLabel:SetText(""); raceLabel:Hide()
+
+		DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced was reset to original settings (centered).")
+
+		MorunoRank()
+
 	-- Turtle mode on/off
 	elseif string.find(msg, "^turtle%s") == 1 then
 		local _, _, arg = string.find(msg, "^turtle%s+(%S+)")
@@ -471,14 +499,27 @@ SlashCmdList["MRE"] = SlashCmd;
 --SLASH MSGs DONE
 
 --EVENTLISTENER
-Frame:SetScript("OnEvent", function()		
-	if IsAddOnLoaded("MorunoRankEnhanced") and not isRunning then
-		isRunning = true; --DONT WANNA CLOG THE SYSTEM 
-		if not initDone then
-			mrInit();	
-		end
-		MorunoRank();
-		isRunning = false;
-	end	
+Frame:SetScript("OnEvent", function()
+  if event == "ADDON_LOADED" then
+    if not initDone and arg1 == "MorunoRankEnhanced" then
+      mrInit()
+    end
+
+  elseif event == "PLAYER_ENTERING_WORLD" then
+    if not initDone then
+      mrInit()
+    end
+    MorunoRank()
+
+  elseif event == "CHAT_MSG_COMBAT_HONOR_GAIN"
+      or event == "PLAYER_PVP_KILLS_CHANGED"
+      or event == "CHAT_MSG_COMBAT_FACTION_CHANGE" then
+
+    if not isRunning then
+      isRunning = true
+      MorunoRank()
+      isRunning = false
+    end
+  end
 end)
 --EVENT LISTENER DONE
