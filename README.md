@@ -9,6 +9,7 @@ New weekly view: a progress bar + label shows **this week’s RP earned** vs **t
 
 Optional helper banners for City Protector (top weekly HKs) and Top‑of‑Race. These are advisory and use your own cutoff inputs.
 
+# CP = Contribution Points.
 ---
 
 ## UI Overview
