@@ -1,504 +1,830 @@
---CORE LOGIC/CALCULATIONS WRITTEN BY MARTOCK(thread: https://forum.nostalrius.org/viewtopic.php?f=63&t=22558)
---EXPANDED WITH UI BY STRETPAKET @ NOSTALRIUS PVP(thread: https://forum.nostalrius.org/viewtopic.php?f=63&t=28269)
+--[[
+MorunoRankEnhanced - Original UI + CP math, with optional in-house Vanilla Ladder Math
+Core logic by Martock; UI by Stretpaket. Ladder math additions (no dependencies).
+]]
+
 local isRunning = false;
-local function isNAN(value) --standard func.
-  return value ~= value
-end
+local function isNAN(value) return value ~= value end
 local initDone = false;
 local chatReport = false
---CREATE FRAME 
+
+--========================
+-- Saved Vars & Defaults
+--========================
+MorunoRank_SV = MorunoRank_SV or {}
+
+-- Original SVs (preserved)
+if MorunoRank_SV["hidden"]      == nil then MorunoRank_SV["hidden"]      = false end
+if MorunoRank_SV["locked"]      == nil then MorunoRank_SV["locked"]      = false end
+if MorunoRank_SV["point"]       == nil then MorunoRank_SV["point"]       = "CENTER" end
+if MorunoRank_SV["relativePoint"]==nil then MorunoRank_SV["relativePoint"]= "CENTER" end
+if MorunoRank_SV["x"]           == nil then MorunoRank_SV["x"]           = 0 end
+if MorunoRank_SV["y"]           == nil then MorunoRank_SV["y"]           = 0 end
+if MorunoRank_SV["turtleMode"]  == nil then MorunoRank_SV["turtleMode"]  = true end
+if MorunoRank_SV["showBanners"] == nil then MorunoRank_SV["showBanners"] = false end
+if MorunoRank_SV["cityCutoffHK"]== nil then MorunoRank_SV["cityCutoffHK"]= 0 end
+if MorunoRank_SV["raceCutoffHK"]== nil then MorunoRank_SV["raceCutoffHK"]= 0 end
+if MorunoRank_SV["race"]        == nil then MorunoRank_SV["race"]        = "" end
+
+-- New SVs (ladder math; defaults keep legacy behavior)
+if MorunoRank_SV["ladderEnabled"] == nil then MorunoRank_SV["ladderEnabled"] = false end -- OFF by default
+if MorunoRank_SV["pool"]          == nil then MorunoRank_SV["pool"]          = 800 end
+if MorunoRank_SV["standing"]      == nil then MorunoRank_SV["standing"]      = nil end
+
+--========================
+-- Pool Prediction (SV + helpers)
+--========================
+
+-- Ensure poolPredict SV exists (safe on first run / reset)
+local function MRE_EnsurePoolPredict()
+  if not MorunoRank_SV then MorunoRank_SV = {} end
+  if not MorunoRank_SV.poolPredict then
+    MorunoRank_SV.poolPredict = {}
+  end
+  local pp = MorunoRank_SV.poolPredict
+  if pp.alpha == nil then pp.alpha = 0.6 end
+  if pp.coverage == nil then pp.coverage = 8 end
+  if type(pp.hist) ~= "table" then pp.hist = {} end
+  if type(pp.seen) ~= "table" then pp.seen = {} end
+  if pp.lastHK == nil then pp.lastHK = 0 end
+  return pp
+end
+
+MorunoRank_SV.poolPredict = MorunoRank_SV.poolPredict or {
+  alpha   = 0.6,   -- EMA weight for this week's signal vs history
+  coverage= 8,     -- each unique same-faction name seen in BG represents ~K total players
+  hist    = {},    -- keep ~last 6 pools
+  seen    = {},    -- set of same-faction names seen on BG scoreboard this week
+  lastHK  = 0,     -- track to detect weekly reset
+}
+
+-- Compute pool from a posted bracket cutoff:
+-- Example: Br14 cutoff=3 -> pool ≈ 3 / 0.003 = 1000
+local function MRE_PoolFromCut(bracket, cutoffStanding)
+  bracket = tonumber(bracket or 0) or 0
+  cutoffStanding = tonumber(cutoffStanding or 0) or 0
+  if bracket < 1 or bracket > 14 or cutoffStanding <= 0 then return nil end
+  local p = MRE_BR_PCTS[bracket]
+  if not p or p <= 0 then return nil end
+  local est = math.floor((cutoffStanding / p) + 0.5)
+  if est < 800 then est = 800 end -- vanilla safeguard
+  return est
+end
+
+-- EMA(blended) pool prediction using BG sampler + baseline (last explicit or history)
+local function MRE_PoolEMA()
+  local pp = MRE_EnsurePoolPredict()
+  local uniq = 0
+  -- count at least one (Lua 5.0 pairs loop)
+  for _ in pairs(pp.seen) do uniq = uniq + 1 end
+
+  local sampleEst = uniq * (pp.coverage or 8)
+  if sampleEst < 800 then sampleEst = 800 end
+
+  local baseline = MorunoRank_SV.pool or 0
+  if baseline <= 0 then
+    local n = table.getn(pp.hist or {})
+    if n > 0 then baseline = pp.hist[n] end
+  end
+  if baseline <= 0 then baseline = 800 end
+
+  local a = pp.alpha or 0.6
+  if a < 0 then a = 0 elseif a > 1 then a = 1 end
+
+  local est = math.floor(a * sampleEst + (1 - a) * baseline + 0.5)
+  if est < 800 then est = 800 end
+  return est, sampleEst, baseline, uniq
+end
+
+-- Weekly reset detection: if This Week HK drops, archive last pool → history and clear sampler
+local function MRE_PoolMaybeResetWeek()
+  if type(GetPVPThisWeekStats) ~= "function" then return end
+  local hk1 = GetPVPThisWeekStats()
+  local hk = hk1 or 0
+  local pp = MRE_EnsurePoolPredict()
+  if hk < (pp.lastHK or 0) then
+    local prevPool = MorunoRank_SV.pool or 0
+    if prevPool > 0 then
+      local n = table.getn(pp.hist)
+      if n >= 6 then table.remove(pp.hist, 1) end
+      table.insert(pp.hist, prevPool)
+    end
+    pp.seen = {}
+  end
+  pp.lastHK = hk
+end
+
+-- BG scoreboard sampler (Vanilla guarded)
+local function MRE_SampleBGScoreboard()
+  if type(GetNumBattlefieldScores) ~= "function" or type(GetBattlefieldScore) ~= "function" then return end
+  local myFaction = UnitFactionGroup and UnitFactionGroup("player") or nil
+  if not myFaction then return end
+
+  local pp = MRE_EnsurePoolPredict()
+  local n = GetNumBattlefieldScores()
+  if not n or n <= 0 then return end
+
+  local facNumSelf = nil
+  if myFaction == "Alliance" then facNumSelf = 0 else facNumSelf = 1 end
+
+  local i
+  for i = 1, n do
+    -- Vanilla GetBattlefieldScore returns multiple fields; faction is usually numeric (0/1) or a string on some cores.
+    local name, killingBlows, honorableKills, deaths, honorGained, faction = GetBattlefieldScore(i)
+    local sameFaction = false
+    if type(faction) == "number" then
+      sameFaction = (faction == facNumSelf)
+    elseif type(faction) == "string" then
+      sameFaction = (faction == myFaction)
+    end
+    if sameFaction and name and name ~= "" then
+      pp.seen[name] = true
+    end
+  end
+end
+
+local function MRE_SetBannerVisibility()
+  if MorunoRank_SV and MorunoRank_SV["showBanners"] then
+    if methodTag and methodTag.Show then methodTag:Show() end
+    if cityLabel and cityLabel.Show then cityLabel:Show() end
+    if raceLabel and raceLabel.Show then raceLabel:Show() end
+  else
+    if methodTag and methodTag.Hide then methodTag:Hide() end
+    if cityLabel and cityLabel.Hide then cityLabel:Hide() end
+    if raceLabel and raceLabel.Hide then raceLabel:Hide() end
+  end
+end
+
+--========================
+-- Frame & UI (unchanged except Lua 5.0 guards)
+--========================
 local Frame = CreateFrame("Frame", "mreFrame", UIParent)
+Frame:SetMovable(true)
+Frame:EnableMouse(true)
+Frame:RegisterForDrag("LeftButton")
+-- Guard for 1.12
+if type(Frame.SetClampedToScreen) == "function" then
+  Frame:SetClampedToScreen(true)
+end
+if type(Frame.SetUserPlaced) == "function" then
+  Frame:SetUserPlaced(true)
+end
 
-	Frame:SetMovable(true)
-	Frame:EnableMouse(true)
-	Frame:RegisterForDrag("LeftButton")
-	Frame:SetClampedToScreen(true)   -- prevents losing it off-screen
-	Frame:SetUserPlaced(true)        -- preserve user placement
+local function MRE_CanDrag() return not (MorunoRank_SV and MorunoRank_SV["locked"]) end
 
-	local function MRE_CanDrag()
-	return not (MorunoRank_SV and MorunoRank_SV["locked"])
-	end
+Frame:SetScript("OnDragStart", function()
+  if MRE_CanDrag() and (IsShiftKeyDown() or IsControlKeyDown() or IsAltKeyDown()) then
+    this:StartMoving()
+  end
+end)
 
-	Frame:SetScript("OnDragStart", function()
-		if MRE_CanDrag() and (IsShiftKeyDown() or IsControlKeyDown() or IsAltKeyDown()) then
-			this:StartMoving()
-		end
-	end)
+Frame:SetScript("OnDragStop", function()
+  this:StopMovingOrSizing()
+  if MorunoRank_SV then
+    local point, _, relativePoint, x, y = this:GetPoint()
+    MorunoRank_SV["point"] = point
+    MorunoRank_SV["relativePoint"] = relativePoint
+    MorunoRank_SV["x"] = x
+    MorunoRank_SV["y"] = y
+  end
+end)
 
-	Frame:SetScript("OnDragStop", function()
-		this:StopMovingOrSizing()
-		if MorunoRank_SV then
-			local point, _, relativePoint, x, y = this:GetPoint()
-			MorunoRank_SV["point"] = point
-			MorunoRank_SV["relativePoint"] = relativePoint
-			MorunoRank_SV["x"] = x
-			MorunoRank_SV["y"] = y
-		end
-	end)
+Frame:SetScript("OnHide", function() this:StopMovingOrSizing() end)
 
-	Frame:SetScript("OnHide", function()
-		this:StopMovingOrSizing()
-	end)
+-- Events (original + new)
+Frame:RegisterEvent("CHAT_MSG_COMBAT_HONOR_GAIN")
+Frame:RegisterEvent("PLAYER_PVP_KILLS_CHANGED")
+Frame:RegisterEvent("CHAT_MSG_COMBAT_FACTION_CHANGE")
+Frame:RegisterEvent("ADDON_LOADED")
+Frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+-- NEW for pool predictor
+Frame:RegisterEvent("UPDATE_BATTLEFIELD_SCORE")
+Frame:RegisterEvent("PLAYER_PVP_RANK_CHANGED")
 
---AND SET EVENTS
-	Frame:RegisterEvent("CHAT_MSG_COMBAT_HONOR_GAIN")--on honorgain
-	Frame:RegisterEvent("PLAYER_PVP_KILLS_CHANGED")--"backup" event, fires when HK's update.
-	Frame:RegisterEvent("CHAT_MSG_COMBAT_FACTION_CHANGE") -- RUN WHEN GETTING REP WITH FACTION(AB/AV/WSG)
-	Frame:RegisterEvent("ADDON_LOADED") --init evnt
-	Frame:RegisterEvent("PLAYER_ENTERING_WORLD") --backup init evnt.
---EVENTS SET.
+-- UI widgets (original)
+local backdrop = {
+  bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+  edgeFile = nil, tile = true, tileSize = 32, edgeSize = 0,
+  insets = { left = 0, right = 0, top = 0, bottom = 0 },
+}
 
---UI STUFF BELOW(XML gth)
-	local backdrop = {
-		bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
-		edgeFile = nil,
-		tile = true, tileSize = 32,
-		edgeSize = 0,
-		insets = { left = 0, right = 0, top = 0, bottom = 0 },
-	}
+Frame:SetWidth(110)
+Frame:SetHeight(72)
+Frame:SetPoint('CENTER', UIParent, 'CENTER', 0,0)
+Frame:SetFrameStrata('MEDIUM')
+Frame:SetBackdrop(backdrop)
+Frame:SetBackdropBorderColor(0, 0, 0, 0)
+Frame:SetBackdropColor(1, 1, 1, 0.4)
 
-	Frame:SetWidth(110)
-	Frame:SetHeight(72)
-	Frame:SetPoint('CENTER', UIParent, 'CENTER', 0,0)
-	Frame:SetFrameStrata('MEDIUM')
-	Frame:SetBackdrop(backdrop)
-	Frame:SetBackdropBorderColor(0, 0, 0, 0) -- optional noop with no edge
-	Frame:SetBackdropColor(1, 1, 1, 0.4)
+local thisWeekLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
+thisWeekLabel:SetFontObject("GameFontNormalSmall")
+thisWeekLabel:SetPoint("TOP", Frame, "TOP", 0, -10)
+thisWeekLabel:SetTextColor(1,1,1);
 
-	local thisWeekLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
-		thisWeekLabel:SetFontObject("GameFontNormalSmall")
-		thisWeekLabel:SetPoint("TOP", Frame, "TOP", 0, -10)
-		thisWeekLabel:SetTextColor(1,1,1);
+local rankLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
+rankLabel:SetFontObject("GameFontNormalSmall")
+rankLabel:SetPoint("TOP", thisWeekLabel, "BOTTOM",0,-2)
+rankLabel:SetTextColor(1,1,1);
 
-	local rankLabel     = Frame:CreateFontString(nil, "ARTWORK", nil)
-		rankLabel:SetFontObject("GameFontNormalSmall")
-		rankLabel:SetPoint("TOP", thisWeekLabel, "BOTTOM",0,-2)
-		rankLabel:SetTextColor(1,1,1);
+local totalRPCalcLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
+totalRPCalcLabel:SetFontObject("GameFontNormalSmall")
+totalRPCalcLabel:SetPoint("TOP", rankLabel, "BOTTOM", 0, -5)
+totalRPCalcLabel:SetTextColor(1,1,1);
+totalRPCalcLabel:SetText("Total RP Calc:");
 
-	local totalRPCalcLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
-		totalRPCalcLabel:SetFontObject("GameFontNormalSmall")
-		totalRPCalcLabel:SetPoint("TOP", rankLabel, "BOTTOM", 0, -5)
-		totalRPCalcLabel:SetTextColor(1,1,1);
-		totalRPCalcLabel:SetText("Total RP Calc:");
+local statusBar2 = CreateFrame("StatusBar", nil, Frame)
+statusBar2:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+statusBar2:SetMinMaxValues(0, 100)
+statusBar2:SetValue(100)
+statusBar2:SetWidth(100)
+statusBar2:SetHeight(12)
+statusBar2:SetPoint("TOP",totalRPCalcLabel,"BOTTOM",0,-2)
+statusBar2:SetBackdrop(backdrop)
+statusBar2:SetBackdropColor(0,0,0,0.5);
+statusBar2:SetStatusBarColor(0,0,1)
 
-	local statusBar2 = CreateFrame("StatusBar", nil, Frame)
-		statusBar2:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
-		statusBar2:SetMinMaxValues(0, 100)
-		statusBar2:SetValue(100)
-		statusBar2:SetWidth(100)
-		statusBar2:SetHeight(12)
-		statusBar2:SetPoint("TOP",totalRPCalcLabel,"BOTTOM",0,-2)
-		statusBar2:SetBackdrop(backdrop)
-		statusBar2:SetBackdropColor(0,0,0,0.5);
-		statusBar2:SetStatusBarColor(0,0,1)
+local statusBar2_Text = statusBar2:CreateFontString(nil, "ARTWORK", nil)
+statusBar2_Text:SetFontObject("GameFontNormalSmall")
+statusBar2_Text:SetPoint("CENTER", statusBar2, "CENTER",0,0)
+statusBar2_Text:SetTextColor(1,1,1);
 
-	local statusBar2_Text = statusBar2:CreateFontString(nil, "ARTWORK", nil)
-		statusBar2_Text:SetFontObject("GameFontNormalSmall")
-		statusBar2_Text:SetPoint("CENTER", statusBar2, "CENTER",0,0)
-		statusBar2_Text:SetTextColor(1,1,1);
+local text2 = Frame:CreateFontString(nil, "ARTWORK", nil)
+text2:SetFontObject("GameFontNormalSmall")
+text2:SetPoint("CENTER", Frame, "TOP", 0, 0)
+text2:SetTextColor(1,0.4,0.7);
+text2:SetText("MorunoRankEnhanced");
 
-	local text2           = Frame:CreateFontString(nil, "ARTWORK", nil)
-		text2:SetFontObject("GameFontNormalSmall")
-		text2:SetPoint("CENTER", Frame, "TOP", 0, 0)
-		text2:SetTextColor(1,0.4,0.7); --PALADIN COLOUR OFC
-		text2:SetText("MorunoRankEnhanced");
+local text3 = Frame:CreateFontString(nil, "ARTWORK", nil)
+text3:SetFontObject("GameFontDarkGraySmall")
+text3:SetPoint("BOTTOM", Frame, "BOTTOM", 0, 1)
+text3:SetAlpha(0.3)
+text3:SetText("STRETPAKET");
 
-	local text3           = Frame:CreateFontString(nil, "ARTWORK", nil)
-		text3:SetFontObject("GameFontDarkGraySmall")
-		text3:SetPoint("BOTTOM", Frame, "BOTTOM", 0, 1)
-		text3:SetAlpha(0.3)
-		text3:SetText("STRETPAKET");
+-- “method” tag (small hint, minimal visual change)
+local methodTag = Frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+methodTag:SetPoint("RIGHT", text2, "RIGHT", -2, -12)
+methodTag:SetText("")
 
-		-- Turtle helpers (labels)
-	local cityLabel       = Frame:CreateFontString(nil, "ARTWORK", nil)
-		cityLabel:SetFontObject("GameFontNormalSmall")
-		cityLabel:SetPoint("TOP", text3, "TOP", 0, 12)
-		cityLabel:SetTextColor(0.9, 0.9, 0.3)
+-- Turtle helper labels (original)
+local cityLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
+cityLabel:SetFontObject("GameFontNormalSmall")
+cityLabel:SetPoint("TOP", text3, "TOP", 0, 12)
+cityLabel:SetTextColor(0.9, 0.9, 0.3)
 
-	local raceLabel       = Frame:CreateFontString(nil, "ARTWORK", nil)
-		raceLabel:SetFontObject("GameFontNormalSmall")
-		raceLabel:SetPoint("TOP", cityLabel, "BOTTOM", 0, -12)
-		raceLabel:SetTextColor(0.9, 0.9, 0.3)
+local raceLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
+raceLabel:SetFontObject("GameFontNormalSmall")
+raceLabel:SetPoint("TOP", cityLabel, "BOTTOM", 0, -12)
+raceLabel:SetTextColor(0.9, 0.9, 0.3)
 
---UI STUFF DONE
-
-
---CORE LOGIC BELOW WRITTEN BY MARTOCK(thread: https://forum.nostalrius.org/viewtopic.php?f=63&t=22558)
-local function getCurrentRank(CurrentRP) -- 
- 
-	local CRank = 0;
-	 
-		if(CurrentRP < 65000) then CRank = 14; end;
-		if(CurrentRP < 60000) then CRank = 13; end;
-		if(CurrentRP < 55000) then CRank = 12; end;
-		if(CurrentRP < 50000) then CRank = 11; end;
-		if(CurrentRP < 45000) then CRank = 10; end;
-		if(CurrentRP < 40000) then CRank = 9; end;
-		if(CurrentRP < 35000) then CRank = 8; end;
-		if(CurrentRP < 30000) then CRank = 7; end;
-		if(CurrentRP < 25000) then CRank = 6; end;
-		if(CurrentRP < 20000) then CRank = 5; end;
-		if(CurrentRP < 15000) then CRank = 4; end;
-		if(CurrentRP < 10000) then CRank = 3; end;
-		if(CurrentRP < 5000) then CRank = 2; end;
-		if(CurrentRP < 2000) then CRank = 1; end;
-		if(CurrentRP < 500) then CRank = 0; end;
-	 
-		return CRank;
- 
+--========================
+-- Original RP helpers
+--========================
+local function getCurrentRank(CurrentRP)
+  local CRank = 0;
+  if(CurrentRP < 65000) then CRank = 14; end;
+  if(CurrentRP < 60000) then CRank = 13; end;
+  if(CurrentRP < 55000) then CRank = 12; end;
+  if(CurrentRP < 50000) then CRank = 11; end;
+  if(CurrentRP < 45000) then CRank = 10; end;
+  if(CurrentRP < 40000) then CRank = 9; end;
+  if(CurrentRP < 35000) then CRank = 8; end;
+  if(CurrentRP < 30000) then CRank = 7; end;
+  if(CurrentRP < 25000) then CRank = 6; end;
+  if(CurrentRP < 20000) then CRank = 5; end;
+  if(CurrentRP < 15000) then CRank = 4; end;
+  if(CurrentRP < 10000) then CRank = 3; end;
+  if(CurrentRP < 5000) then CRank = 2; end;
+  if(CurrentRP < 2000) then CRank = 1; end;
+  if(CurrentRP < 500) then CRank = 0; end;
+  return CRank;
 end;
- 
+
 local function getCurrentHP(CurrentRP)
- 
-	local CRank = 0;
-    if(CurrentRP == 14) then CRank = 60000; end;
-    if(CurrentRP == 13) then CRank = 55000; end;
-    if(CurrentRP == 12) then CRank = 50000; end;
-    if(CurrentRP == 11) then CRank = 45000; end;
-    if(CurrentRP == 10) then CRank = 40000; end;
-    if(CurrentRP == 9) then CRank = 35000; end;
-    if(CurrentRP == 8) then CRank = 30000; end;
-    if(CurrentRP == 7) then CRank = 25000; end;
-    if(CurrentRP == 6) then CRank = 20000; end;
-    if(CurrentRP == 5) then CRank = 15000; end;
-    if(CurrentRP == 4) then CRank = 10000; end;
-    if(CurrentRP == 3) then CRank = 5000; end;
-    if(CurrentRP == 2) then CRank = 2000; end;
-    if(CurrentRP == 1) then CRank = 500; end;
- 
-    return CRank;
- 
+  local CRank = 0;
+  if(CurrentRP == 14) then CRank = 60000; end;
+  if(CurrentRP == 13) then CRank = 55000; end;
+  if(CurrentRP == 12) then CRank = 50000; end;
+  if(CurrentRP == 11) then CRank = 45000; end;
+  if(CurrentRP == 10) then CRank = 40000; end;
+  if(CurrentRP == 9) then CRank = 35000; end;
+  if(CurrentRP == 8) then CRank = 30000; end;
+  if(CurrentRP == 7) then CRank = 25000; end;
+  if(CurrentRP == 6) then CRank = 20000; end;
+  if(CurrentRP == 5) then CRank = 15000; end;
+  if(CurrentRP == 4) then CRank = 10000; end;
+  if(CurrentRP == 3) then CRank = 5000; end;
+  if(CurrentRP == 2) then CRank = 2000; end;
+  if(CurrentRP == 1) then CRank = 500; end;
+  return CRank;
 end;
- 
- 
+
+--========================
+-- In-house Ladder Math (no deps)
+--========================
+local MRE_BR_PCTS = { 1, 0.845, 0.697, 0.566, 0.436, 0.327, 0.228, 0.159, 0.100, 0.060, 0.035, 0.020, 0.008, 0.003 }
+
+local function MRE_BuildTopThresholds(pool)
+  local t = {}
+  local b
+  for b = 1, 14 do
+    local v = math.floor((MRE_BR_PCTS[b] * pool) + 0.5)
+    if v < 1 then v = 1 end
+    t[b] = v
+  end
+  return t
+end
+
+local function MRE_StandingToBracket(standing, pool)
+  if not standing or not pool or standing < 1 or pool < 1 then return nil end
+
+  local thr = MRE_BuildTopThresholds(pool)
+  -- Walk from highest bracket down; first threshold we beat is our bracket
+  local b
+  for b = 14, 2, -1 do
+    if standing <= thr[b] then
+      local best = (b == 14) and 1 or (thr[b + 1] + 1)     -- best (lowest number) in this bracket
+      local worst = thr[b]                                  -- worst (highest number) in this bracket
+      if worst < best then worst = best end
+      local span = worst - best
+      local inside = 1
+      if span > 0 then
+        -- 1.0 at the top of the bracket, 0.0 at the bottom
+        inside = 1 - ((standing - best) / span)
+      end
+      if inside < 0 then inside = 0 elseif inside > 1 then inside = 1 end
+      return b, inside, best, worst
+    end
+  end
+
+  -- Below Br2 threshold => Br1 (the rest)
+  return 1, 0, (thr[2] + 1), pool
+end
+
+local function MRE_BaseRPForBracket(b)
+  if b <= 1 then return 0 end
+  if b == 2 then return 400 end
+  return (b - 2) * 1000
+end
+
+local function MRE_AwardFromStanding(standing, pool)
+  local b, inside = MRE_StandingToBracket(standing, pool)
+  if not b then return nil end
+  local base = MRE_BaseRPForBracket(b)
+  local award = base + 1000 * (inside or 0)
+  if award < 0 then award = 0 end
+  if award > 13000 then award = 13000 end
+  return award, b, inside
+end
+
+local function MRE_CurrentRP()
+  local rank = UnitPVPRank("player") or 0
+  local prog = 0
+  if type(GetPVPRankProgress) == "function" then
+    local p = GetPVPRankProgress("player"); if p then prog = p end
+  end
+  local rp = (rank - 6) * 5000 + math.floor(5000 * prog + 0.5)
+  if rp < 0 then rp = 0 end
+  return rp
+end
+
+local function MRE_RankFloorRP(currentRP)
+  local r = math.floor(currentRP / 5000) * 5000
+  if r < 0 then r = 0 end
+  return r
+end
+
+local function MRE_MinHKRequired()
+  return MorunoRank_SV["turtleMode"] and 1 or 15
+end
+
+-- returns { ok, currentRP, pool, standing, award, nextRP, bracket, inside, hkGate, hk }
+local function MRE_EstimateNextRP(opts)
+  opts = opts or {}
+  local pool = opts.pool or MorunoRank_SV["pool"] or 800
+  local standing = opts.standing or MorunoRank_SV["standing"]
+  local currentRP = (opts.currentRP ~= nil) and opts.currentRP or MRE_CurrentRP()
+
+  if not standing then
+    return { ok=false, reason="NO_STANDING", currentRP=currentRP, pool=pool }
+  end
+
+  local hk = 0
+  if type(GetPVPThisWeekStats) == "function" then
+    -- Lua 5.0-safe (no select)
+    local hk1 = GetPVPThisWeekStats()
+    if hk1 then hk = hk1 end
+  end
+
+  local needHK = MRE_MinHKRequired()
+  local award, bracket, inside = 0, nil, nil
+  local hkGate = false
+
+  if hk < needHK then
+    hkGate = true -- award stays 0; decay only
+  else
+    award, bracket, inside = MRE_AwardFromStanding(standing, pool)
+    if not award then return { ok=false, reason="BAD_INPUT", currentRP=currentRP, pool=pool, standing=standing } end
+  end
+
+  local nextRP = math.floor(0.8 * currentRP + award + 0.5)
+
+  if MorunoRank_SV["turtleMode"] then
+    local floorRP = MRE_RankFloorRP(currentRP)
+    if nextRP < floorRP then nextRP = floorRP end
+  end
+
+  return {
+    ok=true, currentRP=currentRP, pool=pool, standing=standing,
+    award=math.floor(award + 0.5), nextRP=nextRP, bracket=bracket, inside=inside,
+    hkGate=hkGate, hk=hk
+  }
+end
+
+--========================
+-- Main Calc (original + ladder override)
+--========================
 local function MorunoRank()
 
-    local PercentPVPRank = math.floor(GetPVPRankProgress("player") * 100);
-    local UPVPRank = UnitPVPRank("player");
-    local hk, CPLast = GetPVPThisWeekStats();
+  local PercentPVPRank = math.floor((GetPVPRankProgress("player") or 0) * 100);
+  local UPVPRank = UnitPVPRank("player") or 0;
+  local hk, CPLast = 0, 0
+  if type(GetPVPThisWeekStats) == "function" then hk, CPLast = GetPVPThisWeekStats() end
 
-    -- Current RP by original logic
-    local CurrentRP = (UPVPRank - 6) * 5000 + 5000 * PercentPVPRank / 100;
-    local NeededRPToNextRank = (UPVPRank - 5) * 5000 - CurrentRP * 0.8;
+  -- Current RP (original formula)
+  local RA = (UPVPRank - 6) * 5000 + 5000 * PercentPVPRank / 100;
+  local NeededRPToNextRank = (UPVPRank - 5) * 5000 - RA * 0.8;
 
-    local CurrentRank = getCurrentRank(CurrentRP);
-    local RA = CurrentRP;
-	local CPup, CPlo, RPup, RPlo = 0, 0, 0, 0
+  local CurrentRank = getCurrentRank(RA);
+
+  --=== Legacy CP → RP interpolation (unchanged) ===
+  local CPup, CPlo, RPup, RPlo = 0,0,0,0
+  if (CPLast < 910) then CPup=0;CPlo=0;RPup=0;RPlo=0; end;
+  if (CPLast < 2539 and CPLast > 910) then CPup=2539;CPlo=910;RPup=1000;RPlo=400; end;
+  if (CPLast < 5231 and CPLast > 2539) then CPup=5231;CPlo=2539;RPup=2000;RPlo=1000; end;
+  if (CPLast < 9221 and CPLast > 5231) then CPup=9221;CPlo=5231;RPup=3000;RPlo=2000; end;
+  if (CPLast < 15491 and CPLast > 9221) then CPup=15491;CPlo=9221;RPup=4000;RPlo=3000; end;
+  if (CPLast < 23369 and CPLast > 15491) then CPup=23369;CPlo=15491;RPup=5000;RPlo=4000; end;
+  if (CPLast < 36958 and CPLast > 23369) then CPup=36958;CPlo=23369;RPup=6000;RPlo=5000; end;
+  if (CPLast < 54408 and CPLast > 36958) then CPup=54408;CPlo=36958;RPup=7000;RPlo=6000; end;
+  if (CPLast < 76316 and CPLast > 54408) then CPup=76316;CPlo=54408;RPup=8000;RPlo=7000; end;
+  if (CPLast < 120420 and CPLast > 76316) then CPup=120420;CPlo=76316;RPup=9000;RPlo=8000; end;
+  if (CPLast < 164960 and CPLast > 120420) then CPup=164960;CPlo=120420;RPup=10000;RPlo=9000; end;
+  if (CPLast < 226508 and CPLast > 164960) then CPup=226508;CPlo=164960;RPup=11000;RPlo=10000; end;
+  if (CPLast < 315119 and CPLast > 226508) then CPup=315119;CPlo=226508;RPup=12000;RPlo=11000; end;
+  if (CPLast < 431492 and CPLast > 315119) then CPup=431492;CPlo=315119;RPup=13000;RPlo=12000; end;
+
+  local RB_cp = 0;
+  if (CPup ~= CPlo) then
+    RB_cp = (CPLast - CPlo) / (CPup - CPlo) * (RPup - RPlo) + RPlo;
+  end
+
+  local RC = 0.2 * RA;
+
+  -- turtle floor (original)
+  local rawEEarns_cp = math.floor(RA + RB_cp - RC);
+  local floorRP = getCurrentHP(getCurrentRank(RA));
+  local useFloor = MorunoRank_SV["turtleMode"] and true or false;
+  local EEarns_cp = useFloor and math.max(rawEEarns_cp, floorRP) or rawEEarns_cp;
+  local floorApplied_cp = useFloor and (EEarns_cp > rawEEarns_cp);
+
+  --=== New: Ladder math (standing/pool) ===
+  local ladderOK, RB_ladder, EEarns_ladder, floorApplied_ladder, bracket, inside = false, 0, 0, false, nil, nil
+  if MorunoRank_SV["ladderEnabled"] and MorunoRank_SV["standing"] then
+    local r = MRE_EstimateNextRP({ currentRP = RA })
+    if r.ok then
+      ladderOK = true
+      RB_ladder = r.award or 0
+      EEarns_ladder = r.nextRP or RA
+      bracket, inside = r.bracket, r.inside
+      if MorunoRank_SV["turtleMode"] then
+        local floorRP2 = MRE_RankFloorRP(RA)
+        floorApplied_ladder = (EEarns_ladder < floorRP2)
+      end
+    end
+  end
+
+  --=== Choose which numbers drive the UI ===
+  local usingLadder = ladderOK and MorunoRank_SV["ladderEnabled"]
+  local RB = usingLadder and RB_ladder or RB_cp
+  local EEarns = usingLadder and EEarns_ladder or EEarns_cp
+  local floorApplied = usingLadder and floorApplied_ladder or floorApplied_cp
+
+  local EarnedRank = getCurrentRank(EEarns);
+  local nextRankMin = getCurrentHP(EarnedRank + 1);
+  local thisRankMin = getCurrentHP(EarnedRank);
+  local denom = (nextRankMin - thisRankMin);
+  local PercentNextPVPRank = 0;
+  if denom and denom > 0 then
+    PercentNextPVPRank = math.floor(((EEarns - thisRankMin) * 100) / denom);
+  end
+  if PercentNextPVPRank < 0 then PercentNextPVPRank = 0 end
+  if PercentNextPVPRank > 100 then PercentNextPVPRank = 100 end
+
+  if MorunoRank_SV["showBanners"] then
+	methodTag:SetText(usingLadder and "calc: Ladder" or "")
+	if methodTag.Show then methodTag:Show() end
+  else
+	methodTag:SetText("")
+	if methodTag.Hide then methodTag:Hide() end
+  end
 
 
-    -- Original CP -> RP bracket mapping (unchanged)
-    if (CPLast < 910) then CPup=0;CPlo=0;RPup=0;RPlo=0; end;
-    if (CPLast < 2539 and CPLast > 910) then CPup=2539;CPlo=910;RPup=1000;RPlo=400; end;
-    if (CPLast < 5231 and CPLast > 2539) then CPup=5231;CPlo=2539;RPup=2000;RPlo=1000; end;
-    if (CPLast < 9221 and CPLast > 5231) then CPup=9221;CPlo=5231;RPup=3000;RPlo=2000; end;
-    if (CPLast < 15491 and CPLast > 9221) then CPup=15491;CPlo=9221;RPup=4000;RPlo=3000; end;
-    if (CPLast < 23369 and CPLast > 15491) then CPup=23369;CPlo=15491;RPup=5000;RPlo=4000; end;
-    if (CPLast < 36958 and CPLast > 23369) then CPup=36958;CPlo=23369;RPup=6000;RPlo=5000; end;
-    if (CPLast < 54408 and CPLast > 36958) then CPup=54408;CPlo=36958;RPup=7000;RPlo=6000; end;
-    if (CPLast < 76316 and CPLast > 54408) then CPup=76316;CPlo=54408;RPup=8000;RPlo=7000; end;
-    if (CPLast < 120420 and CPLast > 76316) then CPup=120420;CPlo=76316;RPup=9000;RPlo=8000; end;
-    if (CPLast < 164960 and CPLast > 120420) then CPup=164960;CPlo=120420;RPup=10000;RPlo=9000; end;
-    if (CPLast < 226508 and CPLast > 164960) then CPup=226508;CPlo=164960;RPup=11000;RPlo=10000; end;
-    if (CPLast < 315119 and CPLast > 226508) then CPup=315119;CPlo=226508;RPup=12000;RPlo=11000; end;
-    if (CPLast < 431492 and CPLast > 315119) then CPup=431492;CPlo=315119;RPup=13000;RPlo=12000; end;
 
-    local RB = 0;
-    if (CPup and CPlo and RPup and RPlo and CPup ~= CPlo) then
-        RB = (CPLast - CPlo) / (CPup - CPlo) * (RPup - RPlo) + RPlo;
+  -- UI update (original style)
+  if isNAN(PercentNextPVPRank) or not denom or denom == 0 then
+    thisWeekLabel:SetText("Rank incomputable.");
+    rankLabel:SetText("Do some PVP!")
+    totalRPCalcLabel:SetText("(^_^)");
+    statusBar2:SetValue(0);
+    if chatReport then
+      DEFAULT_CHAT_FRAME:AddMessage("Current RP: "..RA.." at "..PercentPVPRank.."% (Rank "..CurrentRank..") RP To Next Rank: "..NeededRPToNextRank.." This Week RP gained:"..math.floor(RB).." @ Total RP Calc: "..EEarns.." at "..PercentNextPVPRank.."%(Rank "..EarnedRank..")", 1, 1, 0);
+      chatReport = false;
+    end
+  else
+    if chatReport then
+      local floorNote = floorApplied and " [Turtle Floor Applied]" or ""
+      local modeNote = usingLadder and " [Ladder]" or " [CP]"
+      DEFAULT_CHAT_FRAME:AddMessage("Current RP: "..RA.." at "..PercentPVPRank.."% (Rank "..CurrentRank..") RP To Next Rank: "..NeededRPToNextRank.." This Week RP gained:"..math.floor(RB).." @ Total RP Calc: "..EEarns.." at "..PercentNextPVPRank.."%(Rank "..EarnedRank..")"..floorNote..modeNote, 1, 1, 0);
+      chatReport = false;
     end
 
-    local RC = 0.2 * RA; -- weekly decay is still computed
+    local nextMin_forNextRank = getCurrentHP(CurrentRank + 1)
+    local weeklyNeededTotal = 0
+    if nextMin_forNextRank then
+      weeklyNeededTotal = math.max(0, nextMin_forNextRank - (RA - RC)) -- = max(0, nextMin - 0.8*RA)
+    end
 
-    -- Turtle change: floor RP at your current rank minimum
-    local rawEEarns = math.floor(RA + RB - RC);
-    local floorRP = getCurrentHP(getCurrentRank(RA)); -- min RP for current rank
-    local useFloor = (MorunoRank_SV and MorunoRank_SV["turtleMode"]) and true or false;
-    local EEarns = useFloor and math.max(rawEEarns, floorRP) or rawEEarns;
-    local floorApplied = useFloor and (EEarns > rawEEarns);
-
-    local EarnedRank = getCurrentRank(EEarns);
-	local nextRankMin = getCurrentHP(EarnedRank + 1);
-	local thisRankMin = getCurrentHP(EarnedRank);
-	local denom = (nextRankMin - thisRankMin);
-	local PercentNextPVPRank = 0;
-	if denom and denom > 0 then
-		PercentNextPVPRank = math.floor(((EEarns - thisRankMin) * 100) / denom);
-	end
-	-- clamp 0..100 (defensive)
-	if PercentNextPVPRank < 0 then PercentNextPVPRank = 0 end
-	if PercentNextPVPRank > 100 then PercentNextPVPRank = 100 end
-
-
-    -- Update UI (original text + Turtle hints)
-    if isNAN(PercentNextPVPRank) or not denom or denom == 0 then
-        thisWeekLabel:SetText("Rank incomputable.");
-        rankLabel:SetText("Do some PVP!")
-        totalRPCalcLabel:SetText("(^_^)");
-        statusBar2:SetValue(0);
-        if chatReport then
-            DEFAULT_CHAT_FRAME:AddMessage("Current RP: "..CurrentRP.." at "..PercentPVPRank.."% (Rank "..CurrentRank..") RP To Next Rank: "..NeededRPToNextRank.." This Week RP gained:"..math.floor(RB).." @ Total RP Calc: "..EEarns.." at "..PercentNextPVPRank.."%(Rank "..EarnedRank..")", 1, 1, 0);
-            chatReport = false;
-        end
+    thisWeekLabel:SetText((usingLadder and "Weekly RP (L): " or "Weekly RP: ") .. math.floor(RB) .. "/" .. weeklyNeededTotal)
+    local weeklyPercent = 0
+    if weeklyNeededTotal > 0 then
+      weeklyPercent = math.floor((math.max(0, RB) / weeklyNeededTotal) * 100)
+      if weeklyPercent > 100 then weeklyPercent = 100 end
     else
-        if chatReport then
-            local floorNote = floorApplied and " [Turtle Floor Applied]" or ""
-            DEFAULT_CHAT_FRAME:AddMessage("Current RP: "..CurrentRP.." at "..PercentPVPRank.."% (Rank "..CurrentRank..") RP To Next Rank: "..NeededRPToNextRank.." This Week RP gained:"..math.floor(RB).." @ Total RP Calc: "..EEarns.." at "..PercentNextPVPRank.."%(Rank "..EarnedRank..")"..floorNote, 1, 1, 0);
-            chatReport = false;
-        end
-        local floorTag = floorApplied and " (floor)" or ""
-        -- total weekly RP needed to reach NEXT rank, starting from RA and including decay:
-		-- Need RB_required such that: RA + RB_required - RC >= nextMin  =>  RB_required >= nextMin - 0.8*RA
-		local nextMin_forNextRank = getCurrentHP(CurrentRank + 1)
-		local weeklyNeededTotal = 0
-		if nextMin_forNextRank then
-			weeklyNeededTotal = math.max(0, nextMin_forNextRank - (RA - RC))  -- = max(0, nextMin - 0.8*RA)
-		end
+      weeklyPercent = 100
+    end
+    local floorTag = floorApplied and " (floor)" or ""
+    rankLabel:SetText("Current rank: Rank "..CurrentRank..(floorApplied and " — Decay floored" or ""))
+    totalRPCalcLabel:SetText("Total RP Calc(Rank "..EarnedRank..")"..floorTag..":")
 
-		-- Show "Weekly RP: <earned>/<needed total>"
-		thisWeekLabel:SetText("Weekly RP: " .. math.floor(RB) .. "/" .. weeklyNeededTotal)
-        local weeklyPercent = 0
-		if weeklyNeededTotal > 0 then
-			weeklyPercent = math.floor((math.max(0, RB) / weeklyNeededTotal) * 100)
-			if weeklyPercent > 100 then weeklyPercent = 100 end
-		else
-			weeklyPercent = 100 -- already at/above next rank requirement for this week
-		end
-				rankLabel:SetText("Current rank: Rank "..CurrentRank..(floorApplied and " — Decay floored" or ""))
-        totalRPCalcLabel:SetText("Total RP Calc(Rank "..EarnedRank..")"..floorTag..":")
-		statusBar2:SetValue(weeklyPercent)
-		statusBar2_Text:SetText(math.floor(RB) .. "/" .. weeklyNeededTotal .. " " .. weeklyPercent .. "%")
+    statusBar2:SetValue(weeklyPercent)
+    statusBar2_Text:SetText(math.floor(RB) .. "/" .. weeklyNeededTotal .. " " .. weeklyPercent .. "%")
+  end
+
+  -- Turtle-only banners (original)
+  if MorunoRank_SV["showBanners"] then
+    cityLabel:Show(); raceLabel:Show()
+    local cutoff = MorunoRank_SV["cityCutoffHK"] or 0
+    local raceCut = MorunoRank_SV["raceCutoffHK"] or 0
+    local myRace  = MorunoRank_SV["race"] or "race?"
+    if cutoff > 0 then
+      if hk and hk >= cutoff then cityLabel:SetText("City Protector: Eligible (est.)")
+      else cityLabel:SetText("City Protector: Needs +".. math.max(cutoff - (hk or 0),0) .." HK") end
+    else cityLabel:SetText("City Protector: set /mre citycutoff <HK>") end
+    if raceCut > 0 then
+      if hk and hk >= raceCut then raceLabel:SetText("Top "..myRace..": Eligible (est.)")
+      else raceLabel:SetText("Top "..myRace..": Needs +".. math.max(raceCut - (hk or 0),0) .." HK") end
+    else raceLabel:SetText("Top-of-race title: /mre race <name>, /mre racecutoff <HK>") end
+  else
+    cityLabel:SetText(""); cityLabel:Hide()
+    raceLabel:SetText(""); raceLabel:Hide()
+  end
+  if type(MRE_SetBannerVisibility) == "function" then
+    MRE_SetBannerVisibility()
+  end
+end
+
+--========================
+-- Init (original with Lua 5.0-safe Show/Hide)
+--========================
+local function mrInit()
+  Frame:UnregisterEvent("ADDON_LOADED")
+  Frame:SetPoint(MorunoRank_SV["point"], nil, MorunoRank_SV["relativePoint"], MorunoRank_SV["x"], MorunoRank_SV["y"]);
+  -- Frame:SetShown(not MorunoRank_SV["hidden"])  -- not in 1.12
+  if MorunoRank_SV["hidden"] then Frame:Hide() else Frame:Show() end
+  Frame:EnableMouse(not MorunoRank_SV["locked"])
+  Frame:SetMovable(not MorunoRank_SV["locked"])
+
+  DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced loaded with UI by Stretpaket",1,0.4,0.7);
+  if MorunoRank_SV["hidden"] then
+    DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is hidden. \"/mre show\" or \"/mre s\" to show.",1,0.4,0.7);
+  else
+    DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is shown \"/mre hide\" or \"/mre h\" to hide.",1,0.4,0.7);
+  end
+  if MorunoRank_SV["locked"] then
+    DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is locked. \"/mre unlock\" or \"/mre u\" to unlock.",1,0.4,0.7);
+  else
+    DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is unlocked \"/mre lock\" or \"/mre l\" to lock.",1,0.4,0.7);
+  end
+  initDone = true
+  MRE_EnsurePoolPredict()
+  MRE_SetBannerVisibility()
+end
+
+--========================
+-- Slash Commands (original + new)
+--========================
+local function SlashCmd(msg)
+  if not msg or msg == "" then
+    DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced(UI by Stretpaket)",1,0.4,0.7);
+    DEFAULT_CHAT_FRAME:AddMessage("Help:");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre show\" or \"/mre s\" to show.");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre hide\" or \"/mre h\" to hide.");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre lock\" or \"/mre l\" to lock.");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre unlock\" or \"/mre u\" to unlock.");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre report\" or \"/mre r\" to see full MorunoRank report.");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre reset\" to reset the window placement.");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre turtle on|off\" — apply Turtle RP floor.");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre banners on|off\" — toggle City/Race AND 'calc: Ladder' tag visibility.");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre citycutoff <HK>\", \"/mre race <name>\", \"/mre racecutoff <HK>\".");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre ladder on|off\" — use Ladder (standing/pool) instead of CP.");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre pool <N>\", \"/mre standing <S>\", \"/mre calc\" for ladder math.");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre pool predict\" — predict pool from BG sampler + EMA,");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre pool alpha <0..1>\", \"/mre pool coverage <K>\", \"/mre pool fromcut <br> <standing>\".");
+    return
+  end
+
+  if msg == "hide" or msg == "h" then
+    Frame:Hide(); MorunoRank_SV["hidden"] = true;
+    DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is hidden. \"/mre show\" or \"/mre s\" to show.",1,0,0);
+
+  elseif msg == "show" or msg=="s" then
+    Frame:Show(); MorunoRank_SV["hidden"] = false;
+    DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is shown \"/mre hide\" or \"/mre h\" to hide.",0,1,0);
+
+  elseif msg == "lock" or msg == "l" then
+    MorunoRank_SV["locked"] = true; Frame:EnableMouse(false); Frame:SetMovable(false)
+    DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is locked. \"/mre unlock\" or \"/mre u\" to unlock.",1,0,0);
+
+  elseif msg == "unlock" or msg == "u" then
+    MorunoRank_SV["locked"] = false; Frame:EnableMouse(true); Frame:SetMovable(true)
+    DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is unlocked \"/mre lock\" or \"/mre l\" to lock.",0,1,0);
+
+  elseif msg == "help" then
+    DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced(UI by Stretpaket)",1,0.4,0.7);
+    DEFAULT_CHAT_FRAME:AddMessage("See /mre for commands.");
+
+  elseif msg == "report" or msg == "r" then
+    chatReport = true; MorunoRank();
+
+  elseif msg == "reset" then
+    Frame:ClearAllPoints()
+    MorunoRank_SV["y"] = 0; MorunoRank_SV["x"] = 0
+    MorunoRank_SV["point"] = "CENTER"; MorunoRank_SV["relativePoint"] = "CENTER"
+    MorunoRank_SV["locked"] = false; MorunoRank_SV["hidden"] = false
+    Frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    Frame:Show(); Frame:EnableMouse(true); Frame:SetMovable(true)
+    cityLabel:SetText(""); cityLabel:Hide(); raceLabel:SetText(""); raceLabel:Hide()
+    DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced was reset to original settings (centered).")
+    MorunoRank()
+
+  -- Turtle mode on/off (original)
+  elseif string.find(msg, "^turtle%s") == 1 then
+    local _, _, arg = string.find(msg, "^turtle%s+(%S+)")
+    if arg == "on" then
+      MorunoRank_SV["turtleMode"] = true
+      DEFAULT_CHAT_FRAME:AddMessage("Turtle Mode: ON (RP never drops below your current rank floor).")
+    elseif arg == "off" then
+      MorunoRank_SV["turtleMode"] = false
+      DEFAULT_CHAT_FRAME:AddMessage("Turtle Mode: OFF (classic behavior, RP can decay below floor).")
+    else
+      DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre turtle on|off")
     end
 
-    -- Turtle-only helper banners (toggleable)
-	if MorunoRank_SV and MorunoRank_SV["showBanners"] then
-		cityLabel:Show(); raceLabel:Show()
+  -- City Protector cutoff (original)
+  elseif string.find(msg, "^citycutoff%s") == 1 then
+    local _, _, nstr = string.find(msg, "^citycutoff%s+(%d+)$")
+    local n = tonumber(nstr or "")
+    if n then MorunoRank_SV["cityCutoffHK"] = n; DEFAULT_CHAT_FRAME:AddMessage("City Protector cutoff set to "..n.." HK.")
+    else DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre citycutoff <HK>") end
 
-		local cutoff = (MorunoRank_SV and MorunoRank_SV["cityCutoffHK"]) or 0
-		local raceCut = (MorunoRank_SV and MorunoRank_SV["raceCutoffHK"]) or 0
-		local myRace  = (MorunoRank_SV and MorunoRank_SV["race"]) or "race?"
+  -- Race cutoff (original)
+  elseif string.find(msg, "^racecutoff%s") == 1 then
+    local _, _, nstr = string.find(msg, "^racecutoff%s+(%d+)$")
+    local n = tonumber(nstr or "")
+    if n then MorunoRank_SV["raceCutoffHK"] = n; DEFAULT_CHAT_FRAME:AddMessage("Race Leader cutoff set to "..n.." HK.")
+    else DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre racecutoff <HK>") end
 
-		if cutoff > 0 then
-			if hk and hk >= cutoff then
-				cityLabel:SetText("City Protector: Eligible (est.)")
-			else
-				local need = cutoff - (hk or 0)
-				cityLabel:SetText("City Protector: Needs +".. math.max(need,0) .." HK")
-			end
-		else
-			cityLabel:SetText("City Protector: set /mre citycutoff <HK>")
-		end
+  -- Race set (original)
+  elseif string.find(msg, "^race%s+") == 1 then
+    local _, _, r = string.find(msg, "^race%s+(.+)$")
+    if r then r = string.gsub(r, "^%s*(.-)%s*$", "%1"); MorunoRank_SV["race"] = r; DEFAULT_CHAT_FRAME:AddMessage("Your race set to: " .. r .. ".")
+    else DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre race <yourRaceName>") end
 
-		if raceCut > 0 then
-			if hk and hk >= raceCut then
-				raceLabel:SetText("Top "..myRace..": Eligible (est.)")
-			else
-				local need = raceCut - (hk or 0)
-				raceLabel:SetText("Top "..myRace..": Needs +".. math.max(need,0) .." HK")
-			end
-		else
-			raceLabel:SetText("Top-of-race title: /mre race <name>, /mre racecutoff <HK>")
-		end
-	else
-		cityLabel:SetText(""); cityLabel:Hide()
-		raceLabel:SetText(""); raceLabel:Hide()
-	end
-end
---LOGIC DONE
+  -- NEW: ladder toggle
+  elseif string.find(msg, "^ladder%s") == 1 then
+    local _, _, arg = string.find(msg, "^ladder%s+(%S+)")
+    if arg == "on" then
+      MorunoRank_SV["ladderEnabled"] = true
+      DEFAULT_CHAT_FRAME:AddMessage("MRE: Ladder math ON (standing/pool).")
+    elseif arg == "off" then
+      MorunoRank_SV["ladderEnabled"] = false
+      DEFAULT_CHAT_FRAME:AddMessage("MRE: Ladder math OFF (CP interpolation).")
+    else
+      DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre ladder on|off")
+    end
+    MorunoRank()
 
---INIT BELOW(LOAD SETTINGS LIKE POS, HIDDEN, LOCKED)
-local function mrInit()	
-	Frame:UnregisterEvent("ADDON_LOADED");--wont be needing this no more	
-	--SEE IF SV's are loaded/set
-	if MorunoRank_SV == nil or MorunoRank_SV["point"] == nil or MorunoRank_SV ["relativePoint"] == nil or MorunoRank_SV["x"] == nil or MorunoRank_SV["y"] == nil or MorunoRank_SV["hidden"] == nil or MorunoRank_SV["locked"] == nil then 
-		--IF NOT, SET IT TO DEFAULT VALUES
-		Frame:SetPoint("CENTER", UIParent, "CENTER", 0,0);		
-		MorunoRank_SV = {}
-		MorunoRank_SV["point"], _, MorunoRank_SV ["relativePoint"], MorunoRank_SV["x"], MorunoRank_SV["y"] = Frame:GetPoint();
-		MorunoRank_SV["hidden"] = false;
-		MorunoRank_SV["locked"] = false;
-		-- Turtle WoW additions (defaults)
-		MorunoRank_SV["showBanners"] = false
-		MorunoRank_SV["turtleMode"]   = true
-		MorunoRank_SV["cityCutoffHK"] = 0
-		MorunoRank_SV["raceCutoffHK"] = 0
-		MorunoRank_SV["race"]         = ""
-		Frame:EnableMouse(true)
-		Frame:SetMovable(true)
-		DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced loaded with UI by Stretpaket",1,0.4,0.7);
-		DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is shown \"/mre hide\" or \"/mre h\" to hide.",1,0.4,0.7);
-		DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is unlocked \"/mre lock\" or \"/mre l\" to lock.",1,0.4,0.7);
-	else
-		--ELSE LOAD FROM SVs
-		Frame:SetPoint(MorunoRank_SV["point"], nil, MorunoRank_SV ["relativePoint"], MorunoRank_SV["x"], MorunoRank_SV["y"]);
-		-- Back-compat defaults for Turtle keys
-		if MorunoRank_SV["showBanners"] == nil then MorunoRank_SV["showBanners"] = false end
-		if MorunoRank_SV["turtleMode"]   == nil then MorunoRank_SV["turtleMode"]   = true end
-		if MorunoRank_SV["cityCutoffHK"] == nil then MorunoRank_SV["cityCutoffHK"] = 0    end
-		if MorunoRank_SV["raceCutoffHK"] == nil then MorunoRank_SV["raceCutoffHK"] = 0    end
-		if MorunoRank_SV["race"]         == nil then MorunoRank_SV["race"]         = ""   end
-		DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced loaded with UI by Stretpaket",1,0.4,0.7);		
-		if MorunoRank_SV["hidden"] == true then
-			Frame:Hide();
-			DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is hidden. \"/mre show\" or \"/mre s\" to show.",1,0.4,0.7);
-		else
-			Frame:Show();
-			DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is shown \"/mre hide\" or \"/mre h\" to hide.",1,0.4,0.7);
-		end		
-		if MorunoRank_SV["locked"] == true then
-			Frame:EnableMouse(false)
-			Frame:SetMovable(false)
-			DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is locked. \"/mre unlock\" or \"/mre u\" to unlock.",1,0.4,0.7);
-		else
-			Frame:EnableMouse(true)
-			Frame:SetMovable(true)
-			DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is unlocked \"/mre lock\" or \"/mre l\" to lock.",1,0.4,0.7);
-		end		
-	end					
-	initDone = true;	
-end
---INIT DONE.
+  -- NEW: pool (explicit number)
+  elseif string.find(msg, "^pool%s") == 1 and string.find(msg, "^pool%s+(%d+)") == 1 then
+	local _, _, n = string.find(msg, "^pool%s+(%d+)")
+    if n then MorunoRank_SV["pool"] = tonumber(n); DEFAULT_CHAT_FRAME:AddMessage("MRE: pool set to "..MorunoRank_SV["pool"]); MorunoRank()
+    else DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre pool <number>") end
 
---SLASH MSGs
-function SlashCmd(msg)
-	if msg == "hide" or msg == "h" then
-		Frame:Hide();
-		MorunoRank_SV["hidden"] = true;
-		DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is hidden. \"/mre show\" or \"/mre s\" to show.",1,0,0);
-	elseif msg == "show" or msg=="s" then
-		Frame:Show();
-		MorunoRank_SV["hidden"] = false;
-		DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is shown \"/mre hide\" or \"/mre h\" to hide.",0,1,0);		
-	elseif msg == "lock" or msg == "l" then
-		MorunoRank_SV["locked"] = true;
-		Frame:EnableMouse(false)
-		Frame:SetMovable(false)
-		DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is locked. \"/mre unlock\" or \"/mre u\" to unlock.",1,0,0);
-	elseif msg == "unlock" or msg == "u" then
-		MorunoRank_SV["locked"] = false;
-		Frame:EnableMouse(true)
-		Frame:SetMovable(true)
-		DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is unlocked \"/mre lock\" or \"/mre l\" to lock.",0,1,0);
-	elseif msg == "help" then
-		DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced(UI by Stretpaket)",1,0.4,0.7);
-		DEFAULT_CHAT_FRAME:AddMessage("Help:");
-		DEFAULT_CHAT_FRAME:AddMessage("\"/mre show\" or \"/mre s\" to show.");
-		DEFAULT_CHAT_FRAME:AddMessage("\"/mre hide\" or \"/mre h\" to hide.");
-		DEFAULT_CHAT_FRAME:AddMessage("\"/mre lock\" or \"/mre l\" to lock.");
-		DEFAULT_CHAT_FRAME:AddMessage("\"/mre unlock\" or \"/mre u\" to unlock.");
-		DEFAULT_CHAT_FRAME:AddMessage("\"/mre report\" or \"/mre r\" to to see full MorunoRank report.");
-	elseif msg == "report" or msg == "r" then
-		chatReport = true;
-		MorunoRank();
-	elseif msg == "reset" then
-		Frame:ClearAllPoints()
-		MorunoRank_SV = {
-			y = 0,
-			x = 0,
-			point = "CENTER",
-			relativePoint = "CENTER",
-			locked = false,
-			hidden = false,
-			turtleMode   = true,
-			cityCutoffHK = 0,
-			raceCutoffHK = 0,
-			race         = "",
-			showBanners  = false,
-		}
-		Frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
-		Frame:Show()
-		Frame:EnableMouse(true)
-		Frame:SetMovable(true)
+  -- NEW: pool alpha
+  elseif string.find(msg, "^pool%s+alpha%s") == 1 then
+	MRE_EnsurePoolPredict()
+    local _, _, a = string.find(msg, "^pool%s+alpha%s+(%d*%.?%d+)")
+    local val = tonumber(a or "")
+    if val and val >= 0 and val <= 1 then
+      MorunoRank_SV.poolPredict.alpha = val
+      DEFAULT_CHAT_FRAME:AddMessage(string.format("MRE: pool EMA alpha set to %.2f", val))
+    else
+      DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre pool alpha <0..1>")
+    end
 
-		cityLabel:SetText(""); cityLabel:Hide()
-		raceLabel:SetText(""); raceLabel:Hide()
+  -- NEW: pool coverage
+  elseif string.find(msg, "^pool%s+coverage%s") == 1 then
+	MRE_EnsurePoolPredict()
+    local _, _, k = string.find(msg, "^pool%s+coverage%s+(%d+)")
+    local val = tonumber(k or "")
+    if val and val >= 1 and val <= 100 then
+      MorunoRank_SV.poolPredict.coverage = val
+      DEFAULT_CHAT_FRAME:AddMessage("MRE: pool coverage factor set to "..val.." (each seen ≈ "..val..")")
+    else
+      DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre pool coverage <1..100>")
+    end
 
-		DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced was reset to original settings (centered).")
+  -- NEW: pool predict
+  elseif msg == "pool predict" then
+	MRE_EnsurePoolPredict()
+    local est, sampleEst, baseline, uniq = MRE_PoolEMA()
+    MorunoRank_SV.pool = est
+    DEFAULT_CHAT_FRAME:AddMessage(string.format(
+      "|cff00ffffMRE|r pool predicted = %d  (sampler≈%d from %d uniques, baseline=%d, alpha=%.2f, coverage=%d)",
+      est, sampleEst, uniq, baseline, MorunoRank_SV.poolPredict.alpha or 0.6, MorunoRank_SV.poolPredict.coverage or 8
+    ))
+    MorunoRank()
 
-		MorunoRank()
+  -- NEW: pool fromcut <bracket> <cutoff>
+  elseif string.find(msg, "^pool%s+fromcut%s") == 1 then
+	MRE_EnsurePoolPredict()
+    local _, _, br, cut = string.find(msg, "^pool%s+fromcut%s+(%d+)%s+(%d+)")
+    local p = MRE_PoolFromCut(br, cut)
+    if p then
+      MorunoRank_SV.pool = p
+      DEFAULT_CHAT_FRAME:AddMessage(string.format("MRE: pool set from cutoff (Br%s=%s) => %d", br, cut, p))
+      MorunoRank()
+    else
+      DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre pool fromcut <bracket 1..14> <cutoff standing>")
+    end
 
-	-- Turtle mode on/off
-	elseif string.find(msg, "^turtle%s") == 1 then
-		local _, _, arg = string.find(msg, "^turtle%s+(%S+)")
-		if arg == "on" then
-			MorunoRank_SV["turtleMode"] = true
-			DEFAULT_CHAT_FRAME:AddMessage("Turtle Mode: ON (RP never drops below your current rank floor).")
-		elseif arg == "off" then
-			MorunoRank_SV["turtleMode"] = false
-			DEFAULT_CHAT_FRAME:AddMessage("Turtle Mode: OFF (classic behavior, RP can decay below floor).")
-		else
-			DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre turtle on|off")
-		end
+  -- NEW: standing
+  elseif string.find(msg, "^standing%s") == 1 then
+    local _, _, s = string.find(msg, "^standing%s+(%d+)")
+    if s then MorunoRank_SV["standing"] = tonumber(s); DEFAULT_CHAT_FRAME:AddMessage("MRE: standing set to "..MorunoRank_SV["standing"]); MorunoRank()
+    else DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre standing <number>") end
 
-	-- City Protector cutoff (weekly HK estimate)
-	elseif string.find(msg, "^citycutoff%s") == 1 then
-		local _, _, nstr = string.find(msg, "^citycutoff%s+(%d+)$")
-		local n = tonumber(nstr or "")
-		if n then
-			MorunoRank_SV["cityCutoffHK"] = n
-			DEFAULT_CHAT_FRAME:AddMessage("City Protector cutoff set to "..n.." HK.")
-		else
-			DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre citycutoff <HK>")
-		end
-
-	-- Per-race top HK cutoff (weekly HK estimate)
-	elseif string.find(msg, "^racecutoff%s") == 1 then
-		local _, _, nstr = string.find(msg, "^racecutoff%s+(%d+)$")
-		local n = tonumber(nstr or "")
-		if n then
-			MorunoRank_SV["raceCutoffHK"] = n
-			DEFAULT_CHAT_FRAME:AddMessage("Race Leader cutoff set to "..n.." HK.")
-		else
-			DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre racecutoff <HK>")
-		end
-
-	-- Set your race name for the per-race title helper
-	elseif string.find(msg, "^race%s+") == 1 then
-		local _, _, r = string.find(msg, "^race%s+(.+)$")
-		if r then
-			-- trim leading/trailing spaces (Lua 5.0-safe)
-			r = string.gsub(r, "^%s*(.-)%s*$", "%1")
-			MorunoRank_SV["race"] = r  -- keep as string, no tonumber!
-			DEFAULT_CHAT_FRAME:AddMessage("Your race set to: " .. r .. ".")
-		else
-			DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre race <yourRaceName>")
-		end
-	elseif string.find(msg, "^banners%s") == 1 then
-		local _, _, arg = string.find(msg, "^banners%s+(%S+)")
-		if arg == "on" then
-			MorunoRank_SV["showBanners"] = true
-			cityLabel:Show(); raceLabel:Show()
-			DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced: banners ON.")
-		elseif arg == "off" then
-			MorunoRank_SV["showBanners"] = false
-			cityLabel:SetText(""); cityLabel:Hide()
-			raceLabel:SetText(""); raceLabel:Hide()
-			DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced: banners OFF.")
-		else
-			DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre banners on|off")
-		end
-	else
-		DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced(UI by Stretpaket)",1,0.4,0.7);
-		DEFAULT_CHAT_FRAME:AddMessage("Help:");
-		DEFAULT_CHAT_FRAME:AddMessage("\"/mre show\" or \"/mre s\" to show.");
-		DEFAULT_CHAT_FRAME:AddMessage("\"/mre hide\" or \"/mre h\" to hide.");
-		DEFAULT_CHAT_FRAME:AddMessage("\"/mre lock\" or \"/mre l\" to lock.");
-		DEFAULT_CHAT_FRAME:AddMessage("\"/mre unlock\" or \"/mre u\" to unlock.");
-		DEFAULT_CHAT_FRAME:AddMessage("\"/mre report\" or \"/mre r\" to see full MorunoRank report.");
-		DEFAULT_CHAT_FRAME:AddMessage("\"/mre reset\" to reset the window placement(to the middle of the screen).");
-		DEFAULT_CHAT_FRAME:AddMessage("\"/mre turtle on|off\"  — apply Turtle RP floor.");
-		DEFAULT_CHAT_FRAME:AddMessage("\"/mre banners on|off\" — show/hide City Protector & top-race banners.");
-        DEFAULT_CHAT_FRAME:AddMessage("\"/mre citycutoff <HK>\" — your estimated top-8 HK cutoff.");
-        DEFAULT_CHAT_FRAME:AddMessage("\"/mre race <name>\" and \"/mre racecutoff <HK>\" — per-race title estimate.");
-
-	end	
+  -- NEW: calc (ladder)
+  elseif msg == "calc" then
+    local r = MRE_EstimateNextRP()
+    if not r.ok then
+      if r.reason == "NO_STANDING" then
+        DEFAULT_CHAT_FRAME:AddMessage("|cffffaa00MRE: set your standing with /mre standing <S> and pool with /mre pool <N>.|r")
+      else
+        DEFAULT_CHAT_FRAME:AddMessage("|cffff5555MRE calc failed: "..tostring(r.reason).."|r")
+      end
+      return
+    end
+    local pct = r.inside and (math.floor(r.inside*100+0.5).."%") or "?"
+    local hkNote = r.hkGate and " (HK gate not met: award=0)" or ""
+    DEFAULT_CHAT_FRAME:AddMessage(string.format("|cff00ffffMRE|r pool=%d standing=%d bracket=%s (%s) award=%d nextRP=%d%s",
+      r.pool or 0, r.standing or -1, r.bracket or 0, pct, r.award or 0, r.nextRP or 0, hkNote))
+  elseif string.find(msg, "^banners%s") == 1 then
+    local _, _, arg = string.find(msg, "^banners%s+(%S+)")
+    if arg == "on" then
+      MorunoRank_SV["showBanners"] = true
+      DEFAULT_CHAT_FRAME:AddMessage("MRE: banners ON (showing City/Race and calc tag).")
+    elseif arg == "off" then
+      MorunoRank_SV["showBanners"] = false
+      DEFAULT_CHAT_FRAME:AddMessage("MRE: banners OFF (hiding City/Race and calc tag).")
+    else
+      DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre banners on|off")
+    end
+    MRE_SetBannerVisibility()
+    MorunoRank()
+  else
+    DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced(UI by Stretpaket)",1,0.4,0.7);
+    DEFAULT_CHAT_FRAME:AddMessage("Use /mre for the full list of commands.")
+  end
 end
 
 SLASH_MRE1 = '/mre';
 SLASH_MRE2 = '/MorunoRankEnhanced';
 SlashCmdList["MRE"] = SlashCmd;
---SLASH MSGs DONE
 
---EVENTLISTENER
+--========================
+-- Event Listener (original + new hooks)
+--========================
 Frame:SetScript("OnEvent", function()
   if event == "ADDON_LOADED" then
     if not initDone and arg1 == "MorunoRankEnhanced" then
@@ -506,15 +832,22 @@ Frame:SetScript("OnEvent", function()
     end
 
   elseif event == "PLAYER_ENTERING_WORLD" then
-    if not initDone then
-      mrInit()
-    end
+    if not initDone then mrInit() end
+    MRE_PoolMaybeResetWeek()   -- NEW
+    MorunoRank()
+
+  elseif event == "UPDATE_BATTLEFIELD_SCORE" then
+    MRE_SampleBGScoreboard()   -- NEW
+
+  elseif event == "PLAYER_PVP_RANK_CHANGED" then
+    MRE_PoolMaybeResetWeek()   -- NEW
     MorunoRank()
 
   elseif event == "CHAT_MSG_COMBAT_HONOR_GAIN"
       or event == "PLAYER_PVP_KILLS_CHANGED"
       or event == "CHAT_MSG_COMBAT_FACTION_CHANGE" then
 
+    MRE_PoolMaybeResetWeek()   -- NEW
     if not isRunning then
       isRunning = true
       MorunoRank()
@@ -522,4 +855,3 @@ Frame:SetScript("OnEvent", function()
     end
   end
 end)
---EVENT LISTENER DONE
