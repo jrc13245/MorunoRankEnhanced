@@ -1,6 +1,7 @@
 --[[
 MorunoRankEnhanced - Original UI + CP math, with optional in-house Vanilla Ladder Math
 Core logic by Martock; UI by Stretpaket. Ladder math additions (no dependencies).
+IMPROVED: More accurate rank prediction display
 ]]
 
 local isRunning = false;
@@ -156,7 +157,7 @@ local function MRE_SetBannerVisibility()
 end
 
 --========================
--- Frame & UI (unchanged except Lua 5.0 guards)
+-- Frame & UI (IMPROVED LAYOUT)
 --========================
 local Frame = CreateFrame("Frame", "mreFrame", UIParent)
 Frame:SetMovable(true)
@@ -201,7 +202,7 @@ Frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 Frame:RegisterEvent("UPDATE_BATTLEFIELD_SCORE")
 Frame:RegisterEvent("PLAYER_PVP_RANK_CHANGED")
 
--- UI widgets (original)
+-- UI widgets (IMPROVED)
 local backdrop = {
   bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
   edgeFile = nil, tile = true, tileSize = 32, edgeSize = 0,
@@ -209,28 +210,27 @@ local backdrop = {
 }
 
 Frame:SetWidth(110)
-Frame:SetHeight(72)
+Frame:SetHeight(95)
 Frame:SetPoint('CENTER', UIParent, 'CENTER', 0,0)
 Frame:SetFrameStrata('MEDIUM')
 Frame:SetBackdrop(backdrop)
 Frame:SetBackdropBorderColor(0, 0, 0, 0)
 Frame:SetBackdropColor(1, 1, 1, 0.4)
 
-local thisWeekLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
-thisWeekLabel:SetFontObject("GameFontNormalSmall")
-thisWeekLabel:SetPoint("TOP", Frame, "TOP", 0, -10)
-thisWeekLabel:SetTextColor(1,1,1);
+-- CHANGED: First line now shows estimated next rank
+local nextRankLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
+nextRankLabel:SetFontObject("GameFontNormalSmall")
+nextRankLabel:SetPoint("TOP", Frame, "TOP", 0, -10)
+nextRankLabel:SetTextColor(1,1,1);
 
-local rankLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
-rankLabel:SetFontObject("GameFontNormalSmall")
-rankLabel:SetPoint("TOP", thisWeekLabel, "BOTTOM",0,-2)
-rankLabel:SetTextColor(1,1,1);
+-- REMOVED: rankLabel (Current rank) - players already know this
 
+-- Progress bar label
 local totalRPCalcLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
 totalRPCalcLabel:SetFontObject("GameFontNormalSmall")
-totalRPCalcLabel:SetPoint("TOP", rankLabel, "BOTTOM", 0, -5)
+totalRPCalcLabel:SetPoint("TOP", nextRankLabel, "BOTTOM", 0, -5)
 totalRPCalcLabel:SetTextColor(1,1,1);
-totalRPCalcLabel:SetText("Total RP Calc:");
+totalRPCalcLabel:SetText("Progress to Next Rank:");
 
 local statusBar2 = CreateFrame("StatusBar", nil, Frame)
 statusBar2:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
@@ -250,30 +250,25 @@ statusBar2_Text:SetTextColor(1,1,1);
 
 local text2 = Frame:CreateFontString(nil, "ARTWORK", nil)
 text2:SetFontObject("GameFontNormalSmall")
-text2:SetPoint("CENTER", Frame, "TOP", 0, 0)
+text2:SetPoint("CENTER", Frame, "TOP", 0, 2)
 text2:SetTextColor(1,0.4,0.7);
 text2:SetText("MorunoRankEnhanced");
 
-local text3 = Frame:CreateFontString(nil, "ARTWORK", nil)
-text3:SetFontObject("GameFontDarkGraySmall")
-text3:SetPoint("BOTTOM", Frame, "BOTTOM", 0, 1)
-text3:SetAlpha(0.3)
-text3:SetText("STRETPAKET");
-
--- “method” tag (small hint, minimal visual change)
-local methodTag = Frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-methodTag:SetPoint("RIGHT", text2, "RIGHT", -2, -12)
+-- "method" tag (centered, in line with display)
+local methodTag = Frame:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+methodTag:SetPoint("TOP", statusBar2, "BOTTOM", 0, -3)
+methodTag:SetTextColor(0.7, 0.7, 0.7)
 methodTag:SetText("")
 
--- Turtle helper labels (original)
+-- Turtle helper labels (moved down to use bottom space)
 local cityLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
 cityLabel:SetFontObject("GameFontNormalSmall")
-cityLabel:SetPoint("TOP", text3, "TOP", 0, 12)
+cityLabel:SetPoint("BOTTOM", Frame, "BOTTOM", 0, 2)
 cityLabel:SetTextColor(0.9, 0.9, 0.3)
 
 local raceLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
 raceLabel:SetFontObject("GameFontNormalSmall")
-raceLabel:SetPoint("TOP", cityLabel, "BOTTOM", 0, -12)
+raceLabel:SetPoint("BOTTOM", cityLabel, "TOP", 0, 2)
 raceLabel:SetTextColor(0.9, 0.9, 0.3)
 
 --========================
@@ -321,7 +316,7 @@ end;
 --========================
 -- In-house Ladder Math (no deps)
 --========================
-local MRE_BR_PCTS = { 1, 0.845, 0.697, 0.566, 0.436, 0.327, 0.228, 0.159, 0.100, 0.060, 0.035, 0.020, 0.008, 0.003 }
+local MRE_BR_PCTS = { 1.00, 0.85, 0.70, 0.55, 0.40, 0.30, 0.20, 0.15, 0.10, 0.06, 0.035, 0.02, 0.008, 0.003 }
 
 local function MRE_BuildTopThresholds(pool)
   local t = {}
@@ -428,10 +423,9 @@ local function MRE_EstimateNextRP(opts)
 
   local nextRP = math.floor(0.8 * currentRP + award + 0.5)
 
-  if MorunoRank_SV["turtleMode"] then
-    local floorRP = MRE_RankFloorRP(currentRP)
-    if nextRP < floorRP then nextRP = floorRP end
-  end
+  -- IMPORTANT: Always apply floor (can't decay below rank minimum)
+  local floorRP = MRE_RankFloorRP(currentRP)
+  if nextRP < floorRP then nextRP = floorRP end
 
   return {
     ok=true, currentRP=currentRP, pool=pool, standing=standing,
@@ -441,7 +435,7 @@ local function MRE_EstimateNextRP(opts)
 end
 
 --========================
--- Main Calc (original + ladder override)
+-- Main Calc (IMPROVED DISPLAY)
 --========================
 local function MorunoRank()
 
@@ -480,12 +474,11 @@ local function MorunoRank()
 
   local RC = 0.2 * RA;
 
-  -- turtle floor (original)
+  -- CP calculation with floor
   local rawEEarns_cp = math.floor(RA + RB_cp - RC);
   local floorRP = getCurrentHP(getCurrentRank(RA));
-  local useFloor = MorunoRank_SV["turtleMode"] and true or false;
-  local EEarns_cp = useFloor and math.max(rawEEarns_cp, floorRP) or rawEEarns_cp;
-  local floorApplied_cp = useFloor and (EEarns_cp > rawEEarns_cp);
+  local EEarns_cp = math.max(rawEEarns_cp, floorRP) -- ALWAYS apply floor
+  local floorApplied_cp = (EEarns_cp > rawEEarns_cp);
 
   --=== New: Ladder math (standing/pool) ===
   local ladderOK, RB_ladder, EEarns_ladder, floorApplied_ladder, bracket, inside = false, 0, 0, false, nil, nil
@@ -496,10 +489,8 @@ local function MorunoRank()
       RB_ladder = r.award or 0
       EEarns_ladder = r.nextRP or RA
       bracket, inside = r.bracket, r.inside
-      if MorunoRank_SV["turtleMode"] then
-        local floorRP2 = MRE_RankFloorRP(RA)
-        floorApplied_ladder = (EEarns_ladder < floorRP2)
-      end
+      local floorRP2 = MRE_RankFloorRP(RA)
+      floorApplied_ladder = (EEarns_ladder < floorRP2)
     end
   end
 
@@ -521,20 +512,17 @@ local function MorunoRank()
   if PercentNextPVPRank > 100 then PercentNextPVPRank = 100 end
 
   if MorunoRank_SV["showBanners"] then
-	methodTag:SetText(usingLadder and "calc: Ladder" or "")
-	if methodTag.Show then methodTag:Show() end
+    methodTag:SetText(usingLadder and "calc: Ladder" or "")
+    if methodTag.Show then methodTag:Show() end
   else
-	methodTag:SetText("")
-	if methodTag.Hide then methodTag:Hide() end
+    methodTag:SetText("")
+    if methodTag.Hide then methodTag:Hide() end
   end
 
-
-
-  -- UI update (original style)
+  -- UI update (IMPROVED)
   if isNAN(PercentNextPVPRank) or not denom or denom == 0 then
-    thisWeekLabel:SetText("Rank incomputable.");
-    rankLabel:SetText("Do some PVP!")
-    totalRPCalcLabel:SetText("(^_^)");
+    nextRankLabel:SetText("Next week: Unknown");
+    totalRPCalcLabel:SetText("Do some PVP!");
     statusBar2:SetValue(0);
     if chatReport then
       DEFAULT_CHAT_FRAME:AddMessage("Current RP: "..RA.." at "..PercentPVPRank.."% (Rank "..CurrentRank..") RP To Next Rank: "..NeededRPToNextRank.." This Week RP gained:"..math.floor(RB).." @ Total RP Calc: "..EEarns.." at "..PercentNextPVPRank.."%(Rank "..EarnedRank..")", 1, 1, 0);
@@ -542,19 +530,33 @@ local function MorunoRank()
     end
   else
     if chatReport then
-      local floorNote = floorApplied and " [Turtle Floor Applied]" or ""
+      local floorNote = floorApplied and " [Floor Applied]" or ""
       local modeNote = usingLadder and " [Ladder]" or " [CP]"
       DEFAULT_CHAT_FRAME:AddMessage("Current RP: "..RA.." at "..PercentPVPRank.."% (Rank "..CurrentRank..") RP To Next Rank: "..NeededRPToNextRank.." This Week RP gained:"..math.floor(RB).." @ Total RP Calc: "..EEarns.." at "..PercentNextPVPRank.."%(Rank "..EarnedRank..")"..floorNote..modeNote, 1, 1, 0);
       chatReport = false;
     end
 
+    -- Calculate progress bar: how far toward NEXT rank
     local nextMin_forNextRank = getCurrentHP(CurrentRank + 1)
     local weeklyNeededTotal = 0
     if nextMin_forNextRank then
       weeklyNeededTotal = math.max(0, nextMin_forNextRank - (RA - RC)) -- = max(0, nextMin - 0.8*RA)
     end
 
-    thisWeekLabel:SetText((usingLadder and "Weekly RP (L): " or "Weekly RP: ") .. math.floor(RB) .. "/" .. weeklyNeededTotal)
+    -- IMPROVED: Show estimated next rank instead of weekly RP
+    local rankChangeText = ""
+    if EarnedRank > CurrentRank then
+      rankChangeText = " (↑ Rank " .. EarnedRank .. ")"
+    elseif EarnedRank < CurrentRank then
+      rankChangeText = " (↓ Rank " .. EarnedRank .. ")"
+    else
+      rankChangeText = " (= Rank " .. EarnedRank .. ")"
+    end
+
+    local floorTag = floorApplied and " [floored]" or ""
+    nextRankLabel:SetText("Next week: " .. PercentNextPVPRank .. "%" .. rankChangeText .. floorTag)
+
+    -- Progress bar shows % toward next rank
     local weeklyPercent = 0
     if weeklyNeededTotal > 0 then
       weeklyPercent = math.floor((math.max(0, RB) / weeklyNeededTotal) * 100)
@@ -562,12 +564,10 @@ local function MorunoRank()
     else
       weeklyPercent = 100
     end
-    local floorTag = floorApplied and " (floor)" or ""
-    rankLabel:SetText("Current rank: Rank "..CurrentRank..(floorApplied and " — Decay floored" or ""))
-    totalRPCalcLabel:SetText("Total RP Calc(Rank "..EarnedRank..")"..floorTag..":")
 
+    totalRPCalcLabel:SetText("Progress to Rank " .. (CurrentRank + 1) .. ":")
     statusBar2:SetValue(weeklyPercent)
-    statusBar2_Text:SetText(math.floor(RB) .. "/" .. weeklyNeededTotal .. " " .. weeklyPercent .. "%")
+    statusBar2_Text:SetText(math.floor(RB) .. "/" .. weeklyNeededTotal .. " RP (" .. weeklyPercent .. "%)")
   end
 
   -- Turtle-only banners (original)
@@ -633,12 +633,12 @@ local function SlashCmd(msg)
     DEFAULT_CHAT_FRAME:AddMessage("\"/mre unlock\" or \"/mre u\" to unlock.");
     DEFAULT_CHAT_FRAME:AddMessage("\"/mre report\" or \"/mre r\" to see full MorunoRank report.");
     DEFAULT_CHAT_FRAME:AddMessage("\"/mre reset\" to reset the window placement.");
-    DEFAULT_CHAT_FRAME:AddMessage("\"/mre turtle on|off\" — apply Turtle RP floor.");
-    DEFAULT_CHAT_FRAME:AddMessage("\"/mre banners on|off\" — toggle City/Race AND 'calc: Ladder' tag visibility.");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre turtle on|off\" – apply RP floor (DEFAULT: ON).");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre banners on|off\" – toggle City/Race AND 'calc: Ladder' tag visibility.");
     DEFAULT_CHAT_FRAME:AddMessage("\"/mre citycutoff <HK>\", \"/mre race <name>\", \"/mre racecutoff <HK>\".");
-    DEFAULT_CHAT_FRAME:AddMessage("\"/mre ladder on|off\" — use Ladder (standing/pool) instead of CP.");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre ladder on|off\" – use Ladder (standing/pool) instead of CP.");
     DEFAULT_CHAT_FRAME:AddMessage("\"/mre pool <N>\", \"/mre standing <S>\", \"/mre calc\" for ladder math.");
-    DEFAULT_CHAT_FRAME:AddMessage("\"/mre pool predict\" — predict pool from BG sampler + EMA,");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre pool predict\" – predict pool from BG sampler + EMA,");
     DEFAULT_CHAT_FRAME:AddMessage("\"/mre pool alpha <0..1>\", \"/mre pool coverage <K>\", \"/mre pool fromcut <br> <standing>\".");
     return
   end
@@ -677,15 +677,15 @@ local function SlashCmd(msg)
     DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced was reset to original settings (centered).")
     MorunoRank()
 
-  -- Turtle mode on/off (original)
+  -- Turtle mode on/off (ALWAYS APPLIES FLOOR NOW)
   elseif string.find(msg, "^turtle%s") == 1 then
     local _, _, arg = string.find(msg, "^turtle%s+(%S+)")
     if arg == "on" then
       MorunoRank_SV["turtleMode"] = true
-      DEFAULT_CHAT_FRAME:AddMessage("Turtle Mode: ON (RP never drops below your current rank floor).")
+      DEFAULT_CHAT_FRAME:AddMessage("Turtle Mode: ON (RP never drops below rank floor, 1 HK minimum).")
     elseif arg == "off" then
       MorunoRank_SV["turtleMode"] = false
-      DEFAULT_CHAT_FRAME:AddMessage("Turtle Mode: OFF (classic behavior, RP can decay below floor).")
+      DEFAULT_CHAT_FRAME:AddMessage("Turtle Mode: OFF (RP never drops below rank floor, 15 HK minimum).")
     else
       DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre turtle on|off")
     end
@@ -726,13 +726,13 @@ local function SlashCmd(msg)
 
   -- NEW: pool (explicit number)
   elseif string.find(msg, "^pool%s") == 1 and string.find(msg, "^pool%s+(%d+)") == 1 then
-	local _, _, n = string.find(msg, "^pool%s+(%d+)")
+    local _, _, n = string.find(msg, "^pool%s+(%d+)")
     if n then MorunoRank_SV["pool"] = tonumber(n); DEFAULT_CHAT_FRAME:AddMessage("MRE: pool set to "..MorunoRank_SV["pool"]); MorunoRank()
     else DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre pool <number>") end
 
   -- NEW: pool alpha
   elseif string.find(msg, "^pool%s+alpha%s") == 1 then
-	MRE_EnsurePoolPredict()
+    MRE_EnsurePoolPredict()
     local _, _, a = string.find(msg, "^pool%s+alpha%s+(%d*%.?%d+)")
     local val = tonumber(a or "")
     if val and val >= 0 and val <= 1 then
@@ -744,7 +744,7 @@ local function SlashCmd(msg)
 
   -- NEW: pool coverage
   elseif string.find(msg, "^pool%s+coverage%s") == 1 then
-	MRE_EnsurePoolPredict()
+    MRE_EnsurePoolPredict()
     local _, _, k = string.find(msg, "^pool%s+coverage%s+(%d+)")
     local val = tonumber(k or "")
     if val and val >= 1 and val <= 100 then
@@ -756,7 +756,7 @@ local function SlashCmd(msg)
 
   -- NEW: pool predict
   elseif msg == "pool predict" then
-	MRE_EnsurePoolPredict()
+    MRE_EnsurePoolPredict()
     local est, sampleEst, baseline, uniq = MRE_PoolEMA()
     MorunoRank_SV.pool = est
     DEFAULT_CHAT_FRAME:AddMessage(string.format(
@@ -767,7 +767,7 @@ local function SlashCmd(msg)
 
   -- NEW: pool fromcut <bracket> <cutoff>
   elseif string.find(msg, "^pool%s+fromcut%s") == 1 then
-	MRE_EnsurePoolPredict()
+    MRE_EnsurePoolPredict()
     local _, _, br, cut = string.find(msg, "^pool%s+fromcut%s+(%d+)%s+(%d+)")
     local p = MRE_PoolFromCut(br, cut)
     if p then
