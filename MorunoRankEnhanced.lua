@@ -1,20 +1,20 @@
 --[[
 MorunoRankEnhanced - Original UI + CP math, with optional in-house Vanilla Ladder Math
 Core logic by Martock; UI by Stretpaket. Ladder math additions (no dependencies).
-IMPROVED: More accurate rank prediction display
+IMPROVED: Automatic pool prediction + enhanced accuracy
 ]]
 
 local isRunning = false;
 local function isNAN(value) return value ~= value end
 local initDone = false;
 local chatReport = false
+local lastBGZone = nil
 
 --========================
 -- Saved Vars & Defaults
 --========================
 MorunoRank_SV = MorunoRank_SV or {}
 
--- Original SVs (preserved)
 if MorunoRank_SV["hidden"]      == nil then MorunoRank_SV["hidden"]      = false end
 if MorunoRank_SV["locked"]      == nil then MorunoRank_SV["locked"]      = false end
 if MorunoRank_SV["point"]       == nil then MorunoRank_SV["point"]       = "CENTER" end
@@ -26,78 +26,138 @@ if MorunoRank_SV["showBanners"] == nil then MorunoRank_SV["showBanners"] = false
 if MorunoRank_SV["cityCutoffHK"]== nil then MorunoRank_SV["cityCutoffHK"]= 0 end
 if MorunoRank_SV["raceCutoffHK"]== nil then MorunoRank_SV["raceCutoffHK"]= 0 end
 if MorunoRank_SV["race"]        == nil then MorunoRank_SV["race"]        = "" end
-
--- New SVs (ladder math; defaults keep legacy behavior)
-if MorunoRank_SV["ladderEnabled"] == nil then MorunoRank_SV["ladderEnabled"] = false end -- OFF by default
+if MorunoRank_SV["ladderEnabled"] == nil then MorunoRank_SV["ladderEnabled"] = false end
 if MorunoRank_SV["pool"]          == nil then MorunoRank_SV["pool"]          = 800 end
 if MorunoRank_SV["standing"]      == nil then MorunoRank_SV["standing"]      = nil end
+if MorunoRank_SV["autoPredict"]   == nil then MorunoRank_SV["autoPredict"]   = true end
+if MorunoRank_SV["showScenarios"] == nil then MorunoRank_SV["showScenarios"] = false end
+if MorunoRank_SV["estimateStanding"] == nil then MorunoRank_SV["estimateStanding"] = true end
 
 --========================
--- Pool Prediction (SV + helpers)
+-- Pool Prediction
 --========================
-
--- Ensure poolPredict SV exists (safe on first run / reset)
 local function MRE_EnsurePoolPredict()
   if not MorunoRank_SV then MorunoRank_SV = {} end
   if not MorunoRank_SV.poolPredict then
     MorunoRank_SV.poolPredict = {}
   end
   local pp = MorunoRank_SV.poolPredict
-  if pp.alpha == nil then pp.alpha = 0.6 end
-  if pp.coverage == nil then pp.coverage = 8 end
+  if pp.alpha == nil then pp.alpha = 0.5 end
+  if pp.coverage == nil then pp.coverage = 12 end
   if type(pp.hist) ~= "table" then pp.hist = {} end
   if type(pp.seen) ~= "table" then pp.seen = {} end
+  if type(pp.bgSamples) ~= "table" then pp.bgSamples = {} end
   if pp.lastHK == nil then pp.lastHK = 0 end
+  if pp.totalBGs == nil then pp.totalBGs = 0 end
+  if pp.confidenceScore == nil then pp.confidenceScore = 0 end
   return pp
 end
 
 MorunoRank_SV.poolPredict = MorunoRank_SV.poolPredict or {
-  alpha   = 0.6,   -- EMA weight for this week's signal vs history
-  coverage= 8,     -- each unique same-faction name seen in BG represents ~K total players
-  hist    = {},    -- keep ~last 6 pools
-  seen    = {},    -- set of same-faction names seen on BG scoreboard this week
-  lastHK  = 0,     -- track to detect weekly reset
+  alpha   = 0.5,
+  coverage= 12,
+  hist    = {},
+  seen    = {},
+  bgSamples = {},
+  lastHK  = 0,
+  totalBGs = 0,
+  confidenceScore = 0,
 }
 
--- Compute pool from a posted bracket cutoff:
--- Example: Br14 cutoff=3 -> pool ≈ 3 / 0.003 = 1000
+local function MRE_CalculateConfidence()
+  local pp = MRE_EnsurePoolPredict()
+  local uniq = 0
+  for _ in pairs(pp.seen) do uniq = uniq + 1 end
+
+  local conf = 0
+
+  if uniq >= 50 then conf = conf + 60
+  elseif uniq >= 30 then conf = conf + 45
+  elseif uniq >= 15 then conf = conf + 30
+  elseif uniq >= 5 then conf = conf + 15
+  end
+
+  local numBGs = pp.totalBGs or 0
+  if numBGs >= 10 then conf = conf + 20
+  elseif numBGs >= 5 then conf = conf + 12
+  elseif numBGs >= 2 then conf = conf + 6
+  end
+
+  local histSize = table.getn(pp.hist or {})
+  if histSize >= 4 then conf = conf + 20
+  elseif histSize >= 2 then conf = conf + 12
+  elseif histSize >= 1 then conf = conf + 6
+  end
+
+  if conf > 100 then conf = 100 end
+  pp.confidenceScore = conf
+  return conf
+end
+
 local function MRE_PoolFromCut(bracket, cutoffStanding)
   bracket = tonumber(bracket or 0) or 0
   cutoffStanding = tonumber(cutoffStanding or 0) or 0
   if bracket < 1 or bracket > 14 or cutoffStanding <= 0 then return nil end
+  local MRE_BR_PCTS = { 1.00, 0.85, 0.70, 0.55, 0.40, 0.30, 0.20, 0.15, 0.10, 0.06, 0.035, 0.02, 0.008, 0.003 }
   local p = MRE_BR_PCTS[bracket]
   if not p or p <= 0 then return nil end
   local est = math.floor((cutoffStanding / p) + 0.5)
-  if est < 800 then est = 800 end -- vanilla safeguard
+  if est < 800 then est = 800 end
   return est
 end
 
--- EMA(blended) pool prediction using BG sampler + baseline (last explicit or history)
 local function MRE_PoolEMA()
   local pp = MRE_EnsurePoolPredict()
   local uniq = 0
-  -- count at least one (Lua 5.0 pairs loop)
   for _ in pairs(pp.seen) do uniq = uniq + 1 end
 
-  local sampleEst = uniq * (pp.coverage or 8)
+  local sampleEst = uniq * (pp.coverage or 12)
   if sampleEst < 800 then sampleEst = 800 end
 
   local baseline = MorunoRank_SV.pool or 0
-  if baseline <= 0 then
-    local n = table.getn(pp.hist or {})
-    if n > 0 then baseline = pp.hist[n] end
+  if baseline <= 0 or baseline < 800 then
+    local histSize = table.getn(pp.hist or {})
+    if histSize > 0 then
+      local sum, weight = 0, 0
+      local i
+      for i = 1, histSize do
+        local w = i / histSize
+        sum = sum + (pp.hist[i] * w)
+        weight = weight + w
+      end
+      if weight > 0 then
+        baseline = math.floor((sum / weight) + 0.5)
+      end
+    end
   end
   if baseline <= 0 then baseline = 800 end
 
-  local a = pp.alpha or 0.6
+  local a = pp.alpha or 0.5
   if a < 0 then a = 0 elseif a > 1 then a = 1 end
+
+  local conf = MRE_CalculateConfidence()
+  if conf < 30 then
+    a = a * 0.6
+  elseif conf > 70 then
+    a = a * 1.2
+    if a > 1 then a = 1 end
+  end
 
   local est = math.floor(a * sampleEst + (1 - a) * baseline + 0.5)
   if est < 800 then est = 800 end
-  return est, sampleEst, baseline, uniq
+
+  if conf < 50 and baseline > 800 then
+    local maxDeviation = baseline * 0.3
+    if est > baseline + maxDeviation then
+      est = math.floor(baseline + maxDeviation + 0.5)
+    elseif est < baseline - maxDeviation then
+      est = math.floor(baseline - maxDeviation + 0.5)
+    end
+  end
+
+  return est, sampleEst, baseline, uniq, conf
 end
 
--- Weekly reset detection: if This Week HK drops, archive last pool → history and clear sampler
 local function MRE_PoolMaybeResetWeek()
   if type(GetPVPThisWeekStats) ~= "function" then return end
   local hk1 = GetPVPThisWeekStats()
@@ -111,11 +171,13 @@ local function MRE_PoolMaybeResetWeek()
       table.insert(pp.hist, prevPool)
     end
     pp.seen = {}
+    pp.bgSamples = {}
+    pp.totalBGs = 0
+    pp.confidenceScore = 0
   end
   pp.lastHK = hk
 end
 
--- BG scoreboard sampler (Vanilla guarded)
 local function MRE_SampleBGScoreboard()
   if type(GetNumBattlefieldScores) ~= "function" or type(GetBattlefieldScore) ~= "function" then return end
   local myFaction = UnitFactionGroup and UnitFactionGroup("player") or nil
@@ -128,9 +190,9 @@ local function MRE_SampleBGScoreboard()
   local facNumSelf = nil
   if myFaction == "Alliance" then facNumSelf = 0 else facNumSelf = 1 end
 
+  local newSeen = 0
   local i
   for i = 1, n do
-    -- Vanilla GetBattlefieldScore returns multiple fields; faction is usually numeric (0/1) or a string on some cores.
     local name, killingBlows, honorableKills, deaths, honorGained, faction = GetBattlefieldScore(i)
     local sameFaction = false
     if type(faction) == "number" then
@@ -139,140 +201,61 @@ local function MRE_SampleBGScoreboard()
       sameFaction = (faction == myFaction)
     end
     if sameFaction and name and name ~= "" then
+      if not pp.seen[name] then
+        newSeen = newSeen + 1
+      end
       pp.seen[name] = true
+    end
+  end
+
+  if newSeen > 0 then
+    table.insert(pp.bgSamples, newSeen)
+  end
+end
+
+local function MRE_AutoPredictPool(silent)
+  if not MorunoRank_SV["autoPredict"] then return end
+
+  MRE_EnsurePoolPredict()
+  local est, sampleEst, baseline, uniq, conf = MRE_PoolEMA()
+
+  if uniq >= 3 then
+    local oldPool = MorunoRank_SV.pool or 800
+    MorunoRank_SV.pool = est
+
+    if not silent then
+      local confText = ""
+      if conf >= 70 then confText = "|cff00ff00High|r"
+      elseif conf >= 40 then confText = "|cffffff00Medium|r"
+      else confText = "|cffff5555Low|r" end
+
+      DEFAULT_CHAT_FRAME:AddMessage(string.format(
+        "|cff00ffffMRE|r Pool auto-predicted: %d (was %d) | Confidence: %s (%d%%) | %d unique names, %d BGs",
+        est, oldPool, confText, conf, uniq, MorunoRank_SV.poolPredict.totalBGs or 0
+      ))
     end
   end
 end
 
-local function MRE_SetBannerVisibility()
-  if MorunoRank_SV and MorunoRank_SV["showBanners"] then
-    if methodTag and methodTag.Show then methodTag:Show() end
-    if cityLabel and cityLabel.Show then cityLabel:Show() end
-    if raceLabel and raceLabel.Show then raceLabel:Show() end
-  else
-    if methodTag and methodTag.Hide then methodTag:Hide() end
-    if cityLabel and cityLabel.Hide then cityLabel:Hide() end
-    if raceLabel and raceLabel.Hide then raceLabel:Hide() end
+local function MRE_CheckBGZone()
+  local inInstance, instanceType = IsInInstance()
+  local currentZone = nil
+
+  if inInstance and instanceType == "pvp" then
+    currentZone = "BG"
   end
+
+  if lastBGZone == "BG" and currentZone ~= "BG" then
+    local pp = MRE_EnsurePoolPredict()
+    pp.totalBGs = (pp.totalBGs or 0) + 1
+    MRE_AutoPredictPool(false)
+  end
+
+  lastBGZone = currentZone
 end
 
 --========================
--- Frame & UI (IMPROVED LAYOUT)
---========================
-local Frame = CreateFrame("Frame", "mreFrame", UIParent)
-Frame:SetMovable(true)
-Frame:EnableMouse(true)
-Frame:RegisterForDrag("LeftButton")
--- Guard for 1.12
-if type(Frame.SetClampedToScreen) == "function" then
-  Frame:SetClampedToScreen(true)
-end
-if type(Frame.SetUserPlaced) == "function" then
-  Frame:SetUserPlaced(true)
-end
-
-local function MRE_CanDrag() return not (MorunoRank_SV and MorunoRank_SV["locked"]) end
-
-Frame:SetScript("OnDragStart", function()
-  if MRE_CanDrag() and (IsShiftKeyDown() or IsControlKeyDown() or IsAltKeyDown()) then
-    this:StartMoving()
-  end
-end)
-
-Frame:SetScript("OnDragStop", function()
-  this:StopMovingOrSizing()
-  if MorunoRank_SV then
-    local point, _, relativePoint, x, y = this:GetPoint()
-    MorunoRank_SV["point"] = point
-    MorunoRank_SV["relativePoint"] = relativePoint
-    MorunoRank_SV["x"] = x
-    MorunoRank_SV["y"] = y
-  end
-end)
-
-Frame:SetScript("OnHide", function() this:StopMovingOrSizing() end)
-
--- Events (original + new)
-Frame:RegisterEvent("CHAT_MSG_COMBAT_HONOR_GAIN")
-Frame:RegisterEvent("PLAYER_PVP_KILLS_CHANGED")
-Frame:RegisterEvent("CHAT_MSG_COMBAT_FACTION_CHANGE")
-Frame:RegisterEvent("ADDON_LOADED")
-Frame:RegisterEvent("PLAYER_ENTERING_WORLD")
--- NEW for pool predictor
-Frame:RegisterEvent("UPDATE_BATTLEFIELD_SCORE")
-Frame:RegisterEvent("PLAYER_PVP_RANK_CHANGED")
-
--- UI widgets (IMPROVED)
-local backdrop = {
-  bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
-  edgeFile = nil, tile = true, tileSize = 32, edgeSize = 0,
-  insets = { left = 0, right = 0, top = 0, bottom = 0 },
-}
-
-Frame:SetWidth(110)
-Frame:SetHeight(95)
-Frame:SetPoint('CENTER', UIParent, 'CENTER', 0,0)
-Frame:SetFrameStrata('MEDIUM')
-Frame:SetBackdrop(backdrop)
-Frame:SetBackdropBorderColor(0, 0, 0, 0)
-Frame:SetBackdropColor(1, 1, 1, 0.4)
-
--- CHANGED: First line now shows estimated next rank
-local nextRankLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
-nextRankLabel:SetFontObject("GameFontNormalSmall")
-nextRankLabel:SetPoint("TOP", Frame, "TOP", 0, -10)
-nextRankLabel:SetTextColor(1,1,1);
-
--- REMOVED: rankLabel (Current rank) - players already know this
-
--- Progress bar label
-local totalRPCalcLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
-totalRPCalcLabel:SetFontObject("GameFontNormalSmall")
-totalRPCalcLabel:SetPoint("TOP", nextRankLabel, "BOTTOM", 0, -5)
-totalRPCalcLabel:SetTextColor(1,1,1);
-totalRPCalcLabel:SetText("Progress to Next Rank:");
-
-local statusBar2 = CreateFrame("StatusBar", nil, Frame)
-statusBar2:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
-statusBar2:SetMinMaxValues(0, 100)
-statusBar2:SetValue(100)
-statusBar2:SetWidth(100)
-statusBar2:SetHeight(12)
-statusBar2:SetPoint("TOP",totalRPCalcLabel,"BOTTOM",0,-2)
-statusBar2:SetBackdrop(backdrop)
-statusBar2:SetBackdropColor(0,0,0,0.5);
-statusBar2:SetStatusBarColor(0,0,1)
-
-local statusBar2_Text = statusBar2:CreateFontString(nil, "ARTWORK", nil)
-statusBar2_Text:SetFontObject("GameFontNormalSmall")
-statusBar2_Text:SetPoint("CENTER", statusBar2, "CENTER",0,0)
-statusBar2_Text:SetTextColor(1,1,1);
-
-local text2 = Frame:CreateFontString(nil, "ARTWORK", nil)
-text2:SetFontObject("GameFontNormalSmall")
-text2:SetPoint("CENTER", Frame, "TOP", 0, 2)
-text2:SetTextColor(1,0.4,0.7);
-text2:SetText("MorunoRankEnhanced");
-
--- "method" tag (centered, in line with display)
-local methodTag = Frame:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-methodTag:SetPoint("TOP", statusBar2, "BOTTOM", 0, -3)
-methodTag:SetTextColor(0.7, 0.7, 0.7)
-methodTag:SetText("")
-
--- Turtle helper labels (moved down to use bottom space)
-local cityLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
-cityLabel:SetFontObject("GameFontNormalSmall")
-cityLabel:SetPoint("BOTTOM", Frame, "BOTTOM", 0, 2)
-cityLabel:SetTextColor(0.9, 0.9, 0.3)
-
-local raceLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
-raceLabel:SetFontObject("GameFontNormalSmall")
-raceLabel:SetPoint("BOTTOM", cityLabel, "TOP", 0, 2)
-raceLabel:SetTextColor(0.9, 0.9, 0.3)
-
---========================
--- Original RP helpers
+-- RP Helper Functions
 --========================
 local function getCurrentRank(CurrentRP)
   local CRank = 0;
@@ -292,7 +275,7 @@ local function getCurrentRank(CurrentRP)
   if(CurrentRP < 2000) then CRank = 1; end;
   if(CurrentRP < 500) then CRank = 0; end;
   return CRank;
-end;
+end
 
 local function getCurrentHP(CurrentRP)
   local CRank = 0;
@@ -311,10 +294,10 @@ local function getCurrentHP(CurrentRP)
   if(CurrentRP == 2) then CRank = 2000; end;
   if(CurrentRP == 1) then CRank = 500; end;
   return CRank;
-end;
+end
 
 --========================
--- In-house Ladder Math (no deps)
+-- Ladder Math
 --========================
 local MRE_BR_PCTS = { 1.00, 0.85, 0.70, 0.55, 0.40, 0.30, 0.20, 0.15, 0.10, 0.06, 0.035, 0.02, 0.008, 0.003 }
 
@@ -333,17 +316,15 @@ local function MRE_StandingToBracket(standing, pool)
   if not standing or not pool or standing < 1 or pool < 1 then return nil end
 
   local thr = MRE_BuildTopThresholds(pool)
-  -- Walk from highest bracket down; first threshold we beat is our bracket
   local b
   for b = 14, 2, -1 do
     if standing <= thr[b] then
-      local best = (b == 14) and 1 or (thr[b + 1] + 1)     -- best (lowest number) in this bracket
-      local worst = thr[b]                                  -- worst (highest number) in this bracket
+      local best = (b == 14) and 1 or (thr[b + 1] + 1)
+      local worst = thr[b]
       if worst < best then worst = best end
       local span = worst - best
       local inside = 1
       if span > 0 then
-        -- 1.0 at the top of the bracket, 0.0 at the bottom
         inside = 1 - ((standing - best) / span)
       end
       if inside < 0 then inside = 0 elseif inside > 1 then inside = 1 end
@@ -351,7 +332,6 @@ local function MRE_StandingToBracket(standing, pool)
     end
   end
 
-  -- Below Br2 threshold => Br1 (the rest)
   return 1, 0, (thr[2] + 1), pool
 end
 
@@ -392,7 +372,6 @@ local function MRE_MinHKRequired()
   return MorunoRank_SV["turtleMode"] and 1 or 15
 end
 
--- returns { ok, currentRP, pool, standing, award, nextRP, bracket, inside, hkGate, hk }
 local function MRE_EstimateNextRP(opts)
   opts = opts or {}
   local pool = opts.pool or MorunoRank_SV["pool"] or 800
@@ -405,7 +384,6 @@ local function MRE_EstimateNextRP(opts)
 
   local hk = 0
   if type(GetPVPThisWeekStats) == "function" then
-    -- Lua 5.0-safe (no select)
     local hk1 = GetPVPThisWeekStats()
     if hk1 then hk = hk1 end
   end
@@ -415,7 +393,7 @@ local function MRE_EstimateNextRP(opts)
   local hkGate = false
 
   if hk < needHK then
-    hkGate = true -- award stays 0; decay only
+    hkGate = true
   else
     award, bracket, inside = MRE_AwardFromStanding(standing, pool)
     if not award then return { ok=false, reason="BAD_INPUT", currentRP=currentRP, pool=pool, standing=standing } end
@@ -423,7 +401,6 @@ local function MRE_EstimateNextRP(opts)
 
   local nextRP = math.floor(0.8 * currentRP + award + 0.5)
 
-  -- IMPORTANT: Always apply floor (can't decay below rank minimum)
   local floorRP = MRE_RankFloorRP(currentRP)
   if nextRP < floorRP then nextRP = floorRP end
 
@@ -434,23 +411,235 @@ local function MRE_EstimateNextRP(opts)
   }
 end
 
+local function MRE_EstimateStanding()
+  if not MorunoRank_SV["standing"] or not MorunoRank_SV["pool"] then
+    return nil
+  end
+
+  local lastStanding = MorunoRank_SV["standing"]
+  local pool = MorunoRank_SV["pool"]
+
+  local hk, cp = 0, 0
+  if type(GetPVPThisWeekStats) == "function" then
+    hk, cp = GetPVPThisWeekStats()
+  end
+
+  if cp < 1000 then
+    return lastStanding, "last_week"
+  end
+
+  local avgCP = pool * 8000
+  local poolAvg = avgCP / pool
+
+  local myRelative = cp / poolAvg
+
+  local estimatedStanding = lastStanding
+
+  if myRelative > 1.5 then
+    estimatedStanding = math.floor(lastStanding * 0.7)
+  elseif myRelative > 1.2 then
+    estimatedStanding = math.floor(lastStanding * 0.85)
+  elseif myRelative < 0.5 then
+    estimatedStanding = math.floor(lastStanding * 1.4)
+  elseif myRelative < 0.8 then
+    estimatedStanding = math.floor(lastStanding * 1.15)
+  end
+
+  if estimatedStanding < 1 then estimatedStanding = 1 end
+  if estimatedStanding > pool then estimatedStanding = pool end
+
+  return estimatedStanding, "estimated"
+end
+
+local function MRE_CalculateScenarios(currentRP)
+  local pool = MorunoRank_SV["pool"] or 800
+  local baseStanding = MorunoRank_SV["standing"]
+
+  if not baseStanding then return nil end
+
+  local scenarios = {}
+
+  local r1 = MRE_EstimateNextRP({ currentRP = currentRP, standing = baseStanding, pool = pool })
+  if r1.ok then
+    scenarios.maintain = {
+      standing = baseStanding,
+      award = r1.award,
+      nextRP = r1.nextRP,
+      bracket = r1.bracket,
+      inside = r1.inside,
+      label = "Maintain"
+    }
+  end
+
+  local betterStanding = math.floor(baseStanding * 0.85)
+  if betterStanding < 1 then betterStanding = 1 end
+  local r2 = MRE_EstimateNextRP({ currentRP = currentRP, standing = betterStanding, pool = pool })
+  if r2.ok then
+    scenarios.improve = {
+      standing = betterStanding,
+      award = r2.award,
+      nextRP = r2.nextRP,
+      bracket = r2.bracket,
+      inside = r2.inside,
+      label = "Improve 15%"
+    }
+  end
+
+  local worseStanding = math.floor(baseStanding * 1.15)
+  if worseStanding > pool then worseStanding = pool end
+  local r3 = MRE_EstimateNextRP({ currentRP = currentRP, standing = worseStanding, pool = pool })
+  if r3.ok then
+    scenarios.worsen = {
+      standing = worseStanding,
+      award = r3.award,
+      nextRP = r3.nextRP,
+      bracket = r3.bracket,
+      inside = r3.inside,
+      label = "Worsen 15%"
+    }
+  end
+
+  return scenarios
+end
+
 --========================
--- Main Calc (IMPROVED DISPLAY)
+-- Frame & UI
+--========================
+local Frame = CreateFrame("Frame", "mreFrame", UIParent)
+Frame:SetMovable(true)
+Frame:EnableMouse(true)
+Frame:RegisterForDrag("LeftButton")
+if type(Frame.SetClampedToScreen) == "function" then
+  Frame:SetClampedToScreen(true)
+end
+if type(Frame.SetUserPlaced) == "function" then
+  Frame:SetUserPlaced(true)
+end
+
+local function MRE_CanDrag() return not (MorunoRank_SV and MorunoRank_SV["locked"]) end
+
+Frame:SetScript("OnDragStart", function()
+  if MRE_CanDrag() and (IsShiftKeyDown() or IsControlKeyDown() or IsAltKeyDown()) then
+    this:StartMoving()
+  end
+end)
+
+Frame:SetScript("OnDragStop", function()
+  this:StopMovingOrSizing()
+  if MorunoRank_SV then
+    local point, _, relativePoint, x, y = this:GetPoint()
+    MorunoRank_SV["point"] = point
+    MorunoRank_SV["relativePoint"] = relativePoint
+    MorunoRank_SV["x"] = x
+    MorunoRank_SV["y"] = y
+  end
+end)
+
+Frame:SetScript("OnHide", function() this:StopMovingOrSizing() end)
+
+Frame:RegisterEvent("CHAT_MSG_COMBAT_HONOR_GAIN")
+Frame:RegisterEvent("PLAYER_PVP_KILLS_CHANGED")
+Frame:RegisterEvent("CHAT_MSG_COMBAT_FACTION_CHANGE")
+Frame:RegisterEvent("ADDON_LOADED")
+Frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+Frame:RegisterEvent("UPDATE_BATTLEFIELD_SCORE")
+Frame:RegisterEvent("PLAYER_PVP_RANK_CHANGED")
+Frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+
+local backdrop = {
+  bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+  edgeFile = nil, tile = true, tileSize = 32, edgeSize = 0,
+  insets = { left = 0, right = 0, top = 0, bottom = 0 },
+}
+
+Frame:SetWidth(110)
+Frame:SetHeight(110)
+Frame:SetPoint('CENTER', UIParent, 'CENTER', 0,0)
+Frame:SetFrameStrata('MEDIUM')
+Frame:SetBackdrop(backdrop)
+Frame:SetBackdropBorderColor(0, 0, 0, 0)
+Frame:SetBackdropColor(1, 1, 1, 0.4)
+
+local nextRankLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
+nextRankLabel:SetFontObject("GameFontNormalSmall")
+nextRankLabel:SetPoint("TOP", Frame, "TOP", 0, -10)
+nextRankLabel:SetTextColor(1,1,1);
+
+local totalRPCalcLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
+totalRPCalcLabel:SetFontObject("GameFontNormalSmall")
+totalRPCalcLabel:SetPoint("TOP", nextRankLabel, "BOTTOM", 0, -5)
+totalRPCalcLabel:SetTextColor(1,1,1);
+totalRPCalcLabel:SetText("Progress to Next Rank:");
+
+-- NEW: CP display label
+local cpLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
+cpLabel:SetFontObject("GameFontNormalSmall")
+cpLabel:SetPoint("TOP", totalRPCalcLabel, "BOTTOM", 0, -2)
+cpLabel:SetTextColor(0.8, 0.8, 1)
+cpLabel:SetText("")
+
+local statusBar2 = CreateFrame("StatusBar", nil, Frame)
+statusBar2:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
+statusBar2:SetMinMaxValues(0, 100)
+statusBar2:SetValue(100)
+statusBar2:SetWidth(100)
+statusBar2:SetHeight(12)
+statusBar2:SetPoint("TOP",cpLabel,"BOTTOM",0,-2)
+statusBar2:SetBackdrop(backdrop)
+statusBar2:SetBackdropColor(0,0,0,0.5);
+statusBar2:SetStatusBarColor(0,0,1)
+
+local statusBar2_Text = statusBar2:CreateFontString(nil, "ARTWORK", nil)
+statusBar2_Text:SetFontObject("GameFontNormalSmall")
+statusBar2_Text:SetPoint("CENTER", statusBar2, "CENTER",0,0)
+statusBar2_Text:SetTextColor(1,1,1);
+
+local text2 = Frame:CreateFontString(nil, "ARTWORK", nil)
+text2:SetFontObject("GameFontNormalSmall")
+text2:SetPoint("CENTER", Frame, "TOP", 0, 2)
+text2:SetTextColor(1,0.4,0.7);
+text2:SetText("MorunoRankEnhanced");
+
+local methodTag = Frame:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+methodTag:SetPoint("TOP", statusBar2, "BOTTOM", 0, -3)
+methodTag:SetTextColor(0.7, 0.7, 0.7)
+methodTag:SetText("")
+
+local cityLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
+cityLabel:SetFontObject("GameFontNormalSmall")
+cityLabel:SetPoint("BOTTOM", Frame, "BOTTOM", 0, 2)
+cityLabel:SetTextColor(0.9, 0.9, 0.3)
+
+local raceLabel = Frame:CreateFontString(nil, "ARTWORK", nil)
+raceLabel:SetFontObject("GameFontNormalSmall")
+raceLabel:SetPoint("BOTTOM", cityLabel, "TOP", 0, 2)
+raceLabel:SetTextColor(0.9, 0.9, 0.3)
+
+local function MRE_SetBannerVisibility()
+  if MorunoRank_SV and MorunoRank_SV["showBanners"] then
+    if methodTag and methodTag.Show then methodTag:Show() end
+    if cityLabel and cityLabel.Show then cityLabel:Show() end
+    if raceLabel and raceLabel.Show then raceLabel:Show() end
+  else
+    if methodTag and methodTag.Hide then methodTag:Hide() end
+    if cityLabel and cityLabel.Hide then cityLabel:Hide() end
+    if raceLabel and raceLabel.Hide then raceLabel:Hide() end
+  end
+end
+
+--========================
+-- Main Calculation
 --========================
 local function MorunoRank()
-
   local PercentPVPRank = math.floor((GetPVPRankProgress("player") or 0) * 100);
   local UPVPRank = UnitPVPRank("player") or 0;
   local hk, CPLast = 0, 0
   if type(GetPVPThisWeekStats) == "function" then hk, CPLast = GetPVPThisWeekStats() end
 
-  -- Current RP (original formula)
   local RA = (UPVPRank - 6) * 5000 + 5000 * PercentPVPRank / 100;
   local NeededRPToNextRank = (UPVPRank - 5) * 5000 - RA * 0.8;
-
   local CurrentRank = getCurrentRank(RA);
 
-  --=== Legacy CP → RP interpolation (unchanged) ===
   local CPup, CPlo, RPup, RPlo = 0,0,0,0
   if (CPLast < 910) then CPup=0;CPlo=0;RPup=0;RPlo=0; end;
   if (CPLast < 2539 and CPLast > 910) then CPup=2539;CPlo=910;RPup=1000;RPlo=400; end;
@@ -473,17 +662,25 @@ local function MorunoRank()
   end
 
   local RC = 0.2 * RA;
-
-  -- CP calculation with floor
   local rawEEarns_cp = math.floor(RA + RB_cp - RC);
   local floorRP = getCurrentHP(getCurrentRank(RA));
-  local EEarns_cp = math.max(rawEEarns_cp, floorRP) -- ALWAYS apply floor
+  local EEarns_cp = math.max(rawEEarns_cp, floorRP)
   local floorApplied_cp = (EEarns_cp > rawEEarns_cp);
 
-  --=== New: Ladder math (standing/pool) ===
   local ladderOK, RB_ladder, EEarns_ladder, floorApplied_ladder, bracket, inside = false, 0, 0, false, nil, nil
   if MorunoRank_SV["ladderEnabled"] and MorunoRank_SV["standing"] then
-    local r = MRE_EstimateNextRP({ currentRP = RA })
+    local useStanding = MorunoRank_SV["standing"]
+    local standingSource = "manual"
+
+    if MorunoRank_SV["estimateStanding"] then
+      local est, source = MRE_EstimateStanding()
+      if est then
+        useStanding = est
+        standingSource = source
+      end
+    end
+
+    local r = MRE_EstimateNextRP({ currentRP = RA, standing = useStanding })
     if r.ok then
       ladderOK = true
       RB_ladder = r.award or 0
@@ -494,7 +691,6 @@ local function MorunoRank()
     end
   end
 
-  --=== Choose which numbers drive the UI ===
   local usingLadder = ladderOK and MorunoRank_SV["ladderEnabled"]
   local RB = usingLadder and RB_ladder or RB_cp
   local EEarns = usingLadder and EEarns_ladder or EEarns_cp
@@ -519,10 +715,20 @@ local function MorunoRank()
     if methodTag.Hide then methodTag:Hide() end
   end
 
-  -- UI update (IMPROVED)
+  -- NEW: Show estimated standing info when using ladder mode
+  if usingLadder and MorunoRank_SV["estimateStanding"] then
+    local est, source = MRE_EstimateStanding()
+    if est and source == "estimated" then
+      if MorunoRank_SV["showBanners"] then
+        methodTag:SetText("calc: Ladder (est standing: "..est..")")
+      end
+    end
+  end
+
   if isNAN(PercentNextPVPRank) or not denom or denom == 0 then
     nextRankLabel:SetText("Next week: Unknown");
     totalRPCalcLabel:SetText("Do some PVP!");
+    cpLabel:SetText("CP: " .. CPLast)
     statusBar2:SetValue(0);
     if chatReport then
       DEFAULT_CHAT_FRAME:AddMessage("Current RP: "..RA.." at "..PercentPVPRank.."% (Rank "..CurrentRank..") RP To Next Rank: "..NeededRPToNextRank.." This Week RP gained:"..math.floor(RB).." @ Total RP Calc: "..EEarns.." at "..PercentNextPVPRank.."%(Rank "..EarnedRank..")", 1, 1, 0);
@@ -536,17 +742,15 @@ local function MorunoRank()
       chatReport = false;
     end
 
-    -- Calculate progress bar: how far toward NEXT rank
     local nextMin_forNextRank = getCurrentHP(CurrentRank + 1)
     local weeklyNeededTotal = 0
     if nextMin_forNextRank then
-      weeklyNeededTotal = math.max(0, nextMin_forNextRank - (RA - RC)) -- = max(0, nextMin - 0.8*RA)
+      weeklyNeededTotal = math.max(0, nextMin_forNextRank - (RA - RC))
     end
 
-    -- IMPROVED: Show estimated next rank instead of weekly RP
     local rankChangeText = ""
     if EarnedRank > CurrentRank then
-      rankChangeText = " (↑ Rank " .. EarnedRank .. ")"
+      rankChangeText = " (→ Rank " .. EarnedRank .. ")"
     elseif EarnedRank < CurrentRank then
       rankChangeText = " (↓ Rank " .. EarnedRank .. ")"
     else
@@ -556,7 +760,6 @@ local function MorunoRank()
     local floorTag = floorApplied and " [floored]" or ""
     nextRankLabel:SetText("Next week: " .. PercentNextPVPRank .. "%" .. rankChangeText .. floorTag)
 
-    -- Progress bar shows % toward next rank
     local weeklyPercent = 0
     if weeklyNeededTotal > 0 then
       weeklyPercent = math.floor((math.max(0, RB) / weeklyNeededTotal) * 100)
@@ -566,11 +769,21 @@ local function MorunoRank()
     end
 
     totalRPCalcLabel:SetText("Progress to Rank " .. (CurrentRank + 1) .. ":")
+
+    -- NEW: Format CP with commas for readability
+    local cpFormatted = tostring(CPLast)
+    if CPLast >= 1000 then
+      cpFormatted = string.gsub(cpFormatted, "(%d)(%d%d%d)$", "%1,%2")
+      if CPLast >= 1000000 then
+        cpFormatted = string.gsub(cpFormatted, "(%d)(%d%d%d),", "%1,%2,")
+      end
+    end
+    cpLabel:SetText("This week CP: " .. cpFormatted)
+
     statusBar2:SetValue(weeklyPercent)
     statusBar2_Text:SetText(math.floor(RB) .. "/" .. weeklyNeededTotal .. " RP (" .. weeklyPercent .. "%)")
   end
 
-  -- Turtle-only banners (original)
   if MorunoRank_SV["showBanners"] then
     cityLabel:Show(); raceLabel:Show()
     local cutoff = MorunoRank_SV["cityCutoffHK"] or 0
@@ -583,7 +796,7 @@ local function MorunoRank()
     if raceCut > 0 then
       if hk and hk >= raceCut then raceLabel:SetText("Top "..myRace..": Eligible (est.)")
       else raceLabel:SetText("Top "..myRace..": Needs +".. math.max(raceCut - (hk or 0),0) .." HK") end
-    else raceLabel:SetText("Top-of-race title: /mre race <name>, /mre racecutoff <HK>") end
+    else raceLabel:SetText("Top-of-race title: /mre race <n>, /mre racecutoff <HK>") end
   else
     cityLabel:SetText(""); cityLabel:Hide()
     raceLabel:SetText(""); raceLabel:Hide()
@@ -594,12 +807,11 @@ local function MorunoRank()
 end
 
 --========================
--- Init (original with Lua 5.0-safe Show/Hide)
+-- Init
 --========================
 local function mrInit()
   Frame:UnregisterEvent("ADDON_LOADED")
   Frame:SetPoint(MorunoRank_SV["point"], nil, MorunoRank_SV["relativePoint"], MorunoRank_SV["x"], MorunoRank_SV["y"]);
-  -- Frame:SetShown(not MorunoRank_SV["hidden"])  -- not in 1.12
   if MorunoRank_SV["hidden"] then Frame:Hide() else Frame:Show() end
   Frame:EnableMouse(not MorunoRank_SV["locked"])
   Frame:SetMovable(not MorunoRank_SV["locked"])
@@ -615,13 +827,21 @@ local function mrInit()
   else
     DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced is unlocked \"/mre lock\" or \"/mre l\" to lock.",1,0.4,0.7);
   end
+
+  if MorunoRank_SV["autoPredict"] then
+    DEFAULT_CHAT_FRAME:AddMessage("Pool auto-prediction: |cff00ff00ON|r (runs after each BG)",1,0.4,0.7);
+  else
+    DEFAULT_CHAT_FRAME:AddMessage("Pool auto-prediction: |cffff5555OFF|r (/mre autopredict on to enable)",1,0.4,0.7);
+  end
+
   initDone = true
   MRE_EnsurePoolPredict()
   MRE_SetBannerVisibility()
+  MRE_AutoPredictPool(true)
 end
 
 --========================
--- Slash Commands (original + new)
+-- Slash Commands
 --========================
 local function SlashCmd(msg)
   if not msg or msg == "" then
@@ -635,11 +855,16 @@ local function SlashCmd(msg)
     DEFAULT_CHAT_FRAME:AddMessage("\"/mre reset\" to reset the window placement.");
     DEFAULT_CHAT_FRAME:AddMessage("\"/mre turtle on|off\" – apply RP floor (DEFAULT: ON).");
     DEFAULT_CHAT_FRAME:AddMessage("\"/mre banners on|off\" – toggle City/Race AND 'calc: Ladder' tag visibility.");
-    DEFAULT_CHAT_FRAME:AddMessage("\"/mre citycutoff <HK>\", \"/mre race <name>\", \"/mre racecutoff <HK>\".");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre citycutoff <HK>\", \"/mre race <n>\", \"/mre racecutoff <HK>\".");
     DEFAULT_CHAT_FRAME:AddMessage("\"/mre ladder on|off\" – use Ladder (standing/pool) instead of CP.");
     DEFAULT_CHAT_FRAME:AddMessage("\"/mre pool <N>\", \"/mre standing <S>\", \"/mre calc\" for ladder math.");
-    DEFAULT_CHAT_FRAME:AddMessage("\"/mre pool predict\" – predict pool from BG sampler + EMA,");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre pool predict\" – predict pool from BG sampler + EMA.");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre autopredict on|off\" – toggle auto-prediction after BGs (DEFAULT: ON).");
     DEFAULT_CHAT_FRAME:AddMessage("\"/mre pool alpha <0..1>\", \"/mre pool coverage <K>\", \"/mre pool fromcut <br> <standing>\".");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre pool status\" – show current pool prediction confidence.");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre scenarios\" – show best/worst case rank predictions (ladder mode).");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre estimate on|off\" – toggle standing estimation (DEFAULT: ON).");
+    DEFAULT_CHAT_FRAME:AddMessage("\"/mre standing status\" – show current/estimated standing.");
     return
   end
 
@@ -677,7 +902,6 @@ local function SlashCmd(msg)
     DEFAULT_CHAT_FRAME:AddMessage("MorunoRankEnhanced was reset to original settings (centered).")
     MorunoRank()
 
-  -- Turtle mode on/off (ALWAYS APPLIES FLOOR NOW)
   elseif string.find(msg, "^turtle%s") == 1 then
     local _, _, arg = string.find(msg, "^turtle%s+(%S+)")
     if arg == "on" then
@@ -690,27 +914,23 @@ local function SlashCmd(msg)
       DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre turtle on|off")
     end
 
-  -- City Protector cutoff (original)
   elseif string.find(msg, "^citycutoff%s") == 1 then
     local _, _, nstr = string.find(msg, "^citycutoff%s+(%d+)$")
     local n = tonumber(nstr or "")
     if n then MorunoRank_SV["cityCutoffHK"] = n; DEFAULT_CHAT_FRAME:AddMessage("City Protector cutoff set to "..n.." HK.")
     else DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre citycutoff <HK>") end
 
-  -- Race cutoff (original)
   elseif string.find(msg, "^racecutoff%s") == 1 then
     local _, _, nstr = string.find(msg, "^racecutoff%s+(%d+)$")
     local n = tonumber(nstr or "")
     if n then MorunoRank_SV["raceCutoffHK"] = n; DEFAULT_CHAT_FRAME:AddMessage("Race Leader cutoff set to "..n.." HK.")
     else DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre racecutoff <HK>") end
 
-  -- Race set (original)
   elseif string.find(msg, "^race%s+") == 1 then
     local _, _, r = string.find(msg, "^race%s+(.+)$")
     if r then r = string.gsub(r, "^%s*(.-)%s*$", "%1"); MorunoRank_SV["race"] = r; DEFAULT_CHAT_FRAME:AddMessage("Your race set to: " .. r .. ".")
     else DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre race <yourRaceName>") end
 
-  -- NEW: ladder toggle
   elseif string.find(msg, "^ladder%s") == 1 then
     local _, _, arg = string.find(msg, "^ladder%s+(%S+)")
     if arg == "on" then
@@ -724,13 +944,59 @@ local function SlashCmd(msg)
     end
     MorunoRank()
 
-  -- NEW: pool (explicit number)
-  elseif string.find(msg, "^pool%s") == 1 and string.find(msg, "^pool%s+(%d+)") == 1 then
-    local _, _, n = string.find(msg, "^pool%s+(%d+)")
-    if n then MorunoRank_SV["pool"] = tonumber(n); DEFAULT_CHAT_FRAME:AddMessage("MRE: pool set to "..MorunoRank_SV["pool"]); MorunoRank()
-    else DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre pool <number>") end
+  elseif string.find(msg, "^autopredict%s") == 1 then
+    local _, _, arg = string.find(msg, "^autopredict%s+(%S+)")
+    if arg == "on" then
+      MorunoRank_SV["autoPredict"] = true
+      DEFAULT_CHAT_FRAME:AddMessage("MRE: Pool auto-prediction |cff00ff00ON|r (will run after each BG)")
+    elseif arg == "off" then
+      MorunoRank_SV["autoPredict"] = false
+      DEFAULT_CHAT_FRAME:AddMessage("MRE: Pool auto-prediction |cffff5555OFF|r")
+    else
+      DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre autopredict on|off")
+    end
 
-  -- NEW: pool alpha
+  elseif msg == "pool predict" then
+    MRE_EnsurePoolPredict()
+    local est, sampleEst, baseline, uniq, conf = MRE_PoolEMA()
+    MorunoRank_SV.pool = est
+
+    local confText = ""
+    if conf >= 70 then confText = "|cff00ff00High|r"
+    elseif conf >= 40 then confText = "|cffffff00Medium|r"
+    else confText = "|cffff5555Low|r" end
+
+    DEFAULT_CHAT_FRAME:AddMessage(string.format(
+      "|cff00ffffMRE|r Pool predicted: %d | Confidence: %s (%d%%)",
+      est, confText, conf
+    ))
+    DEFAULT_CHAT_FRAME:AddMessage(string.format(
+      "  Sample≈%d from %d names, %d BGs | Baseline=%d | alpha=%.2f, coverage=%d",
+      sampleEst, uniq, MorunoRank_SV.poolPredict.totalBGs or 0, baseline,
+      MorunoRank_SV.poolPredict.alpha or 0.5, MorunoRank_SV.poolPredict.coverage or 12
+    ))
+    MorunoRank()
+
+  elseif msg == "pool status" then
+    MRE_EnsurePoolPredict()
+    local pp = MorunoRank_SV.poolPredict
+    local uniq = 0
+    for _ in pairs(pp.seen) do uniq = uniq + 1 end
+    local conf = MRE_CalculateConfidence()
+
+    local confText = ""
+    if conf >= 70 then confText = "|cff00ff00High|r"
+    elseif conf >= 40 then confText = "|cffffff00Medium|r"
+    else confText = "|cffff5555Low|r" end
+
+    DEFAULT_CHAT_FRAME:AddMessage("|cff00ffffMRE Pool Prediction Status:|r")
+    DEFAULT_CHAT_FRAME:AddMessage(string.format("  Current pool: %d", MorunoRank_SV.pool or 800))
+    DEFAULT_CHAT_FRAME:AddMessage(string.format("  Confidence: %s (%d%%)", confText, conf))
+    DEFAULT_CHAT_FRAME:AddMessage(string.format("  Unique names seen: %d", uniq))
+    DEFAULT_CHAT_FRAME:AddMessage(string.format("  BGs completed: %d", pp.totalBGs or 0))
+    DEFAULT_CHAT_FRAME:AddMessage(string.format("  Historical pools: %d weeks", table.getn(pp.hist or {})))
+    DEFAULT_CHAT_FRAME:AddMessage(string.format("  Settings: alpha=%.2f, coverage=%d", pp.alpha or 0.5, pp.coverage or 12))
+
   elseif string.find(msg, "^pool%s+alpha%s") == 1 then
     MRE_EnsurePoolPredict()
     local _, _, a = string.find(msg, "^pool%s+alpha%s+(%d*%.?%d+)")
@@ -742,7 +1008,6 @@ local function SlashCmd(msg)
       DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre pool alpha <0..1>")
     end
 
-  -- NEW: pool coverage
   elseif string.find(msg, "^pool%s+coverage%s") == 1 then
     MRE_EnsurePoolPredict()
     local _, _, k = string.find(msg, "^pool%s+coverage%s+(%d+)")
@@ -754,18 +1019,6 @@ local function SlashCmd(msg)
       DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre pool coverage <1..100>")
     end
 
-  -- NEW: pool predict
-  elseif msg == "pool predict" then
-    MRE_EnsurePoolPredict()
-    local est, sampleEst, baseline, uniq = MRE_PoolEMA()
-    MorunoRank_SV.pool = est
-    DEFAULT_CHAT_FRAME:AddMessage(string.format(
-      "|cff00ffffMRE|r pool predicted = %d  (sampler≈%d from %d uniques, baseline=%d, alpha=%.2f, coverage=%d)",
-      est, sampleEst, uniq, baseline, MorunoRank_SV.poolPredict.alpha or 0.6, MorunoRank_SV.poolPredict.coverage or 8
-    ))
-    MorunoRank()
-
-  -- NEW: pool fromcut <bracket> <cutoff>
   elseif string.find(msg, "^pool%s+fromcut%s") == 1 then
     MRE_EnsurePoolPredict()
     local _, _, br, cut = string.find(msg, "^pool%s+fromcut%s+(%d+)%s+(%d+)")
@@ -778,13 +1031,72 @@ local function SlashCmd(msg)
       DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre pool fromcut <bracket 1..14> <cutoff standing>")
     end
 
-  -- NEW: standing
-  elseif string.find(msg, "^standing%s") == 1 then
-    local _, _, s = string.find(msg, "^standing%s+(%d+)")
-    if s then MorunoRank_SV["standing"] = tonumber(s); DEFAULT_CHAT_FRAME:AddMessage("MRE: standing set to "..MorunoRank_SV["standing"]); MorunoRank()
-    else DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre standing <number>") end
+  elseif string.find(msg, "^pool%s+(%d+)") == 1 then
+    local _, _, n = string.find(msg, "^pool%s+(%d+)")
+    if n then
+      MorunoRank_SV["pool"] = tonumber(n)
+      DEFAULT_CHAT_FRAME:AddMessage("MRE: pool set to "..MorunoRank_SV["pool"])
+      MorunoRank()
+    else
+      DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre pool <number>")
+    end
 
-  -- NEW: calc (ladder)
+  elseif string.find(msg, "^standing%s") == 1 then
+    -- Check for "standing status" first
+    if msg == "standing status" then
+      if not MorunoRank_SV["standing"] then
+        DEFAULT_CHAT_FRAME:AddMessage("|cffffaa00MRE: No standing set. Use /mre standing <number> to set it.|r")
+        return
+      end
+
+      local baseStanding = MorunoRank_SV["standing"]
+      DEFAULT_CHAT_FRAME:AddMessage("|cff00ffffMRE Standing Status:|r")
+      DEFAULT_CHAT_FRAME:AddMessage(string.format("  Base standing (last week): %d", baseStanding))
+
+      if MorunoRank_SV["estimateStanding"] then
+        local est, source = MRE_EstimateStanding()
+        if est then
+          if source == "estimated" then
+            local hk, cp = 0, 0
+            if type(GetPVPThisWeekStats) == "function" then
+              hk, cp = GetPVPThisWeekStats()
+            end
+
+            local change = est - baseStanding
+            local changeText = ""
+            if change < 0 then
+              changeText = string.format("|cff00ff00%d (improving)|r", change)
+            elseif change > 0 then
+              changeText = string.format("|cffff5555+%d (falling)|r", change)
+            else
+              changeText = "|cffffff000 (maintaining)|r"
+            end
+
+            DEFAULT_CHAT_FRAME:AddMessage(string.format("  Estimated standing: %d (change: %s)", est, changeText))
+            DEFAULT_CHAT_FRAME:AddMessage(string.format("  This week's CP: %d", cp))
+            DEFAULT_CHAT_FRAME:AddMessage("  Note: Estimation based on this week's honor vs pool average")
+          else
+            DEFAULT_CHAT_FRAME:AddMessage(string.format("  Using base standing: %d (early in week, <1000 CP)", est))
+          end
+        else
+          DEFAULT_CHAT_FRAME:AddMessage("  Estimation: Not available (need pool set)")
+        end
+      else
+        DEFAULT_CHAT_FRAME:AddMessage("  Estimation: |cffff5555OFF|r (using base standing)")
+        DEFAULT_CHAT_FRAME:AddMessage("  Use /mre estimate on to enable automatic adjustment")
+      end
+    else
+      -- Original standing set command
+      local _, _, s = string.find(msg, "^standing%s+(%d+)")
+      if s then
+        MorunoRank_SV["standing"] = tonumber(s)
+        DEFAULT_CHAT_FRAME:AddMessage("MRE: standing set to "..MorunoRank_SV["standing"])
+        MorunoRank()
+      else
+        DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre standing <number>  or  /mre standing status")
+      end
+    end
+
   elseif msg == "calc" then
     local r = MRE_EstimateNextRP()
     if not r.ok then
@@ -799,6 +1111,133 @@ local function SlashCmd(msg)
     local hkNote = r.hkGate and " (HK gate not met: award=0)" or ""
     DEFAULT_CHAT_FRAME:AddMessage(string.format("|cff00ffffMRE|r pool=%d standing=%d bracket=%s (%s) award=%d nextRP=%d%s",
       r.pool or 0, r.standing or -1, r.bracket or 0, pct, r.award or 0, r.nextRP or 0, hkNote))
+
+  elseif msg == "scenarios" then
+    if not MorunoRank_SV["ladderEnabled"] then
+      DEFAULT_CHAT_FRAME:AddMessage("|cffffaa00MRE: Enable ladder mode first with /mre ladder on|r")
+      return
+    end
+    if not MorunoRank_SV["standing"] then
+      DEFAULT_CHAT_FRAME:AddMessage("|cffffaa00MRE: Set your standing first with /mre standing <S>|r")
+      return
+    end
+
+    local RA = (UnitPVPRank("player") - 6) * 5000 + 5000 * math.floor((GetPVPRankProgress("player") or 0) * 100) / 100
+
+    -- Use the same standing that the main display uses
+    local baseStanding = MorunoRank_SV["standing"]
+    local displayStanding = baseStanding
+
+    if MorunoRank_SV["estimateStanding"] then
+      local est, source = MRE_EstimateStanding()
+      if est and source == "estimated" then
+        displayStanding = est
+      end
+    end
+
+    local scenarios = MRE_CalculateScenarios(RA)
+
+    if not scenarios then
+      DEFAULT_CHAT_FRAME:AddMessage("|cffff5555MRE: Could not calculate scenarios|r")
+      return
+    end
+
+    DEFAULT_CHAT_FRAME:AddMessage("|cff00ffffMRE Rank Scenarios:|r (pool="..MorunoRank_SV["pool"]..")")
+
+    -- Show what standing is being used
+    if MorunoRank_SV["estimateStanding"] and displayStanding ~= baseStanding then
+      DEFAULT_CHAT_FRAME:AddMessage(string.format("  Base standing: %d | Estimated: %d (using estimated)", baseStanding, displayStanding))
+    else
+      DEFAULT_CHAT_FRAME:AddMessage(string.format("  Using standing: %d", displayStanding))
+    end
+
+    -- Calculate scenarios based on the ESTIMATED standing (what's actually being used)
+    local scenariosFromEstimated = {}
+
+    -- Maintain estimated
+    local r1 = MRE_EstimateNextRP({ currentRP = RA, standing = displayStanding, pool = MorunoRank_SV["pool"] })
+    if r1.ok then
+      scenariosFromEstimated.maintain = {
+        standing = displayStanding,
+        award = r1.award,
+        nextRP = r1.nextRP,
+        bracket = r1.bracket,
+        inside = r1.inside,
+        label = "Maintain current"
+      }
+    end
+
+    -- Improve 15%
+    local betterStanding = math.floor(displayStanding * 0.85)
+    if betterStanding < 1 then betterStanding = 1 end
+    local r2 = MRE_EstimateNextRP({ currentRP = RA, standing = betterStanding, pool = MorunoRank_SV["pool"] })
+    if r2.ok then
+      scenariosFromEstimated.improve = {
+        standing = betterStanding,
+        award = r2.award,
+        nextRP = r2.nextRP,
+        bracket = r2.bracket,
+        inside = r2.inside,
+        label = "Improve 15%"
+      }
+    end
+
+    -- Worsen 15%
+    local worseStanding = math.floor(displayStanding * 1.15)
+    if worseStanding > MorunoRank_SV["pool"] then worseStanding = MorunoRank_SV["pool"] end
+    local r3 = MRE_EstimateNextRP({ currentRP = RA, standing = worseStanding, pool = MorunoRank_SV["pool"] })
+    if r3.ok then
+      scenariosFromEstimated.worsen = {
+        standing = worseStanding,
+        award = r3.award,
+        nextRP = r3.nextRP,
+        bracket = r3.bracket,
+        inside = r3.inside,
+        label = "Worsen 15%"
+      }
+    end
+
+    if scenariosFromEstimated.improve then
+      local s = scenariosFromEstimated.improve
+      local nextRank = getCurrentRank(s.nextRP)
+      DEFAULT_CHAT_FRAME:AddMessage(string.format(
+        "  |cff00ff00%s|r: Standing %d → Br%d, award %d RP → Rank %d",
+        s.label, s.standing, s.bracket or 0, s.award, nextRank
+      ))
+    end
+
+    if scenariosFromEstimated.maintain then
+      local s = scenariosFromEstimated.maintain
+      local nextRank = getCurrentRank(s.nextRP)
+      DEFAULT_CHAT_FRAME:AddMessage(string.format(
+        "  |cffffff00%s|r: Standing %d → Br%d, award %d RP → Rank %d",
+        s.label, s.standing, s.bracket or 0, s.award, nextRank
+      ))
+    end
+
+    if scenariosFromEstimated.worsen then
+      local s = scenariosFromEstimated.worsen
+      local nextRank = getCurrentRank(s.nextRP)
+      DEFAULT_CHAT_FRAME:AddMessage(string.format(
+        "  |cffff5555%s|r: Standing %d → Br%d, award %d RP → Rank %d",
+        s.label, s.standing, s.bracket or 0, s.award, nextRank
+      ))
+    end
+
+  elseif string.find(msg, "^estimate%s") == 1 then
+    local _, _, arg = string.find(msg, "^estimate%s+(%S+)")
+    if arg == "on" then
+      MorunoRank_SV["estimateStanding"] = true
+      DEFAULT_CHAT_FRAME:AddMessage("MRE: Standing estimation |cff00ff00ON|r (adjusts based on this week's honor)")
+      MorunoRank()
+    elseif arg == "off" then
+      MorunoRank_SV["estimateStanding"] = false
+      DEFAULT_CHAT_FRAME:AddMessage("MRE: Standing estimation |cffff5555OFF|r (uses exact standing value)")
+      MorunoRank()
+    else
+      DEFAULT_CHAT_FRAME:AddMessage("Usage: /mre estimate on|off")
+    end
+
   elseif string.find(msg, "^banners%s") == 1 then
     local _, _, arg = string.find(msg, "^banners%s+(%S+)")
     if arg == "on" then
@@ -823,7 +1262,7 @@ SLASH_MRE2 = '/MorunoRankEnhanced';
 SlashCmdList["MRE"] = SlashCmd;
 
 --========================
--- Event Listener (original + new hooks)
+-- Event Listener
 --========================
 Frame:SetScript("OnEvent", function()
   if event == "ADDON_LOADED" then
@@ -833,21 +1272,24 @@ Frame:SetScript("OnEvent", function()
 
   elseif event == "PLAYER_ENTERING_WORLD" then
     if not initDone then mrInit() end
-    MRE_PoolMaybeResetWeek()   -- NEW
+    MRE_PoolMaybeResetWeek()
     MorunoRank()
 
+  elseif event == "ZONE_CHANGED_NEW_AREA" then
+    MRE_CheckBGZone()
+
   elseif event == "UPDATE_BATTLEFIELD_SCORE" then
-    MRE_SampleBGScoreboard()   -- NEW
+    MRE_SampleBGScoreboard()
 
   elseif event == "PLAYER_PVP_RANK_CHANGED" then
-    MRE_PoolMaybeResetWeek()   -- NEW
+    MRE_PoolMaybeResetWeek()
     MorunoRank()
 
   elseif event == "CHAT_MSG_COMBAT_HONOR_GAIN"
       or event == "PLAYER_PVP_KILLS_CHANGED"
       or event == "CHAT_MSG_COMBAT_FACTION_CHANGE" then
 
-    MRE_PoolMaybeResetWeek()   -- NEW
+    MRE_PoolMaybeResetWeek()
     if not isRunning then
       isRunning = true
       MorunoRank()
